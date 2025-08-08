@@ -1,0 +1,14 @@
+{
+  "name": "ai-receptionist-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.7.0",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.52.0",
+    "twilio": "^4.23.2",
+    "node-fetch": "^3.3.2"
+  }
+}

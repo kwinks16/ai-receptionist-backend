@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: ai-receptionist-backend
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    envVars:
+      - key: PORT
+        value: "3000"
+      - key: PUBLIC_BASE_URL
+        value: "" # set after first deploy (copy Render URL)
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: USER_FORWARD_NUMBER
+        value: "+15551234567"
+      - key: FIRESTORE_COLLECTION
+        value: "voicemails"
+    secretFiles:
+      - name: service-account.json
+        fileName: service-account.json
