@@ -9,7 +9,7 @@ services:
       - key: PORT
         value: "3000"
       - key: PUBLIC_BASE_URL
-        value: "" # set after first deploy (copy Render URL)
+        value: ""   # leave blank on first deploy; set after you get the Render URL
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
@@ -20,6 +20,3 @@ services:
         value: "+15551234567"
       - key: FIRESTORE_COLLECTION
         value: "voicemails"
-    secretFiles:
-      - name: service-account.json
-        fileName: service-account.json
