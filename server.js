@@ -37,6 +37,18 @@ const app = express();
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
 app.use(express.json());
 
+app.get("/health-firestore", async (req, res) => {
+  try {
+    const col = process.env.FIRESTORE_COLLECTION || "voicemails";
+    const snap = await firestore.collection(col).orderBy("time", "desc").limit(1).get();
+    res.json({ ok: true, collection: col, docsFound: snap.size, lastId: snap.docs[0]?.id || null });
+  } catch (err) {
+    console.error("Firestore health error:", err);
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+
 // --- ultra-stable /voice handlers (no deps) ---
 function basicTwiml(greetingText) {
   const g = greetingText && greetingText.trim()
@@ -192,12 +204,24 @@ function buildTwiml(req) {
 
 // Twilio posts here after recording completes
 app.post("/voicemail-complete", async (req, res) => {
+  const { RecordingUrl, From, To, CallSid, Caller, Timestamp } = req.body;
+  console.log(`[vm] callback: CallSid=${CallSid} From=${From} To=${To} RecordingUrl=${RecordingUrl}`);
+
   try {
-    const { RecordingUrl, From, To, CallSid, Caller, Timestamp } = req.body;
-    if (!RecordingUrl) return res.sendStatus(200);
+    if (!RecordingUrl) {
+      console.warn("[vm] no RecordingUrl in callback, ignoring");
+      return res.sendStatus(200);
+    }
 
     const mp3Url = `${RecordingUrl}.mp3`;
     const transcript = await transcribeFromUrl(mp3Url);
+    console.log(`[vm] transcript length=${(transcript || "").length}`);
+
+    // Skip save if no transcript text
+    if (!transcript || !transcript.trim()) {
+      console.warn("[vm] empty transcript; not saving to Firestore");
+      return res.sendStatus(200);
+    }
 
     const doc = {
       id: crypto.randomUUID(),
@@ -209,17 +233,20 @@ app.post("/voicemail-complete", async (req, res) => {
       isNew: true,
       recordingUrl: mp3Url,
       callSid: CallSid,
-      to: To,
+      to: To
     };
 
-    await firestore.collection(FIRESTORE_COLLECTION).doc(doc.id).set(doc);
+    console.log("[vm] writing doc to Firestore…");
+    await firestore.collection(process.env.FIRESTORE_COLLECTION || "voicemails").doc(doc.id).set(doc);
+    console.log(`[vm] saved: collection=${process.env.FIRESTORE_COLLECTION || "voicemails"} id=${doc.id}`);
     res.sendStatus(200);
+
   } catch (e) {
-    console.error("voicemail-complete error:", e);
-    // Return 200 to avoid Twilio retry storms; we logged the error
-    res.sendStatus(200);
+    console.error("[vm] error (no write):", e?.message || e);
+    res.sendStatus(200); // don’t trigger Twilio retries storm
   }
 });
+
 
 //------------- test firestore connection ---------------
 app.get("/test-firestore", async (req, res) => {
