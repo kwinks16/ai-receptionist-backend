@@ -44,24 +44,52 @@ function summarize(text = "") {
 }
 
 async function transcribeFromUrl(mp3Url) {
-  // Download Twilio recording with basic auth (recordings are protected)
+  // Download Twilio recording with basic auth
   const res = await fetch(mp3Url, { headers: { Authorization: twilioBasicAuth } });
   if (!res.ok) throw new Error(`Audio download failed ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
 
-  // Write to temp, then stream to OpenAI Whisper
+  // Write to a temp file
   const tmp = path.join(os.tmpdir(), `vm-${crypto.randomUUID()}.mp3`);
   fs.writeFileSync(tmp, buf);
+
+  const maxAttempts = 3;
+  let attempt = 0, lastErr;
+
   try {
-    const tr = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(tmp),
-      model: "whisper-1",
-    });
-    return tr.text || "";
+    while (attempt < maxAttempts) {
+      attempt++;
+      try {
+        const tr = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(tmp),
+          model: "whisper-1"
+        });
+        return tr.text || "";
+      } catch (err) {
+        lastErr = err;
+        // ECONNRESET / timeouts → retry
+        const msg = (err && err.message) ? err.message : String(err);
+        const isTransient =
+          msg.includes("ECONNRESET") ||
+          msg.includes("ETIMEDOUT") ||
+          msg.includes("timeout") ||
+          msg.includes("socket hang up") ||
+          (err && err.code === "ECONNRESET");
+
+        if (!isTransient || attempt >= maxAttempts) {
+          throw err;
+        }
+        const delay = 500 * Math.pow(2, attempt - 1); // 500ms, 1000ms, 2000ms
+        console.warn(`Whisper retry ${attempt}/${maxAttempts} in ${delay}ms… (${msg})`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+    throw lastErr || new Error("Unknown transcription error");
   } finally {
     fs.unlink(tmp, () => {});
   }
 }
+
 
 // Build TwiML for both GET and POST /voice
 function buildTwiml(req) {
