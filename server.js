@@ -7,6 +7,12 @@ import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { APIConnectionError } from "openai";
+
+
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
+
 
 const {
   PORT = 3000,
@@ -69,13 +75,11 @@ function summarize(text = "") {
 }
 
 async function transcribeFromUrl(mp3Url) {
-  // Download Twilio recording with basic auth (protected URL)
   const res = await fetch(mp3Url, { headers: { Authorization: twilioBasicAuth } });
   if (!res.ok) throw new Error(`Audio download failed ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   console.log(`[transcribe] downloaded ${buf.length} bytes from Twilio`);
 
-  // Write to temp, then stream to OpenAI Whisper
   const tmp = path.join(os.tmpdir(), `vm-${crypto.randomUUID()}.mp3`);
   fs.writeFileSync(tmp, buf);
 
@@ -94,17 +98,20 @@ async function transcribeFromUrl(mp3Url) {
         console.log(`[transcribe] success (len=${text.length})`);
         return text;
       } catch (err) {
-        const msg = (err && err.message) ? err.message : String(err);
-        const code = err?.code || "";
+        const msg = err?.message || String(err);
         const transient =
+          err instanceof APIConnectionError ||
           msg.includes("ECONNRESET") ||
           msg.includes("ETIMEDOUT") ||
           msg.toLowerCase().includes("timeout") ||
-          msg.includes("socket hang up") ||
-          code === "ECONNRESET";
+          msg.includes("socket hang up");
+
         console.warn(`[transcribe] error: ${msg} (transient=${transient})`);
-        if (!transient || attempt >= MAX) throw err;
-        const delay = 700 * Math.pow(2, attempt - 1); // 0.7s, 1.4s, 2.8s, 5.6s, 11.2s
+
+        if (!transient || attempt >= MAX) {
+          throw err; // give up (your /voicemail-complete already skips DB write on failure)
+        }
+        const delay = 700 * Math.pow(2, attempt - 1); // 0.7s, 1.4s, 2.8s, 5.6s
         await new Promise(r => setTimeout(r, delay));
       }
     }
@@ -113,6 +120,7 @@ async function transcribeFromUrl(mp3Url) {
     fs.unlink(tmp, () => {});
   }
 }
+
 
 
 // Build TwiML for both GET and POST /voice
@@ -168,6 +176,7 @@ app.post("/voicemail-complete", async (req, res) => {
   }
 });
 
+//------------- test firestore connection ---------------
 app.get("/test-firestore", async (req, res) => {
   try {
     const docRef = firestore.collection(FIRESTORE_COLLECTION).doc();
@@ -183,6 +192,17 @@ app.get("/test-firestore", async (req, res) => {
   } catch (err) {
     console.error("Firestore test error:", err);
     res.status(500).send("Error writing to Firestore");
+  }
+});
+
+// ----------- test openai connection ---------------
+app.get("/health-openai", async (req, res) => {
+  try {
+    // a tiny call that hits OpenAI but doesn't cost anything significant
+    const list = await openai.models.list({ limit: 1 });
+    res.json({ ok: true, modelsSeen: list.data?.length ?? 0 });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
