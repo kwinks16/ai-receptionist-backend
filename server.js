@@ -10,8 +10,12 @@ import path from "path";
 import { APIConnectionError } from "openai";
 
 
+import https from "https";
 import dns from "dns";
+import FormData from "form-data";
+
 dns.setDefaultResultOrder("ipv4first");
+
 
 
 const {
@@ -75,44 +79,84 @@ function summarize(text = "") {
 }
 
 async function transcribeFromUrl(mp3Url) {
+  // 1) Download Twilio audio (protected) over basic auth
   const res = await fetch(mp3Url, { headers: { Authorization: twilioBasicAuth } });
   if (!res.ok) throw new Error(`Audio download failed ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   console.log(`[transcribe] downloaded ${buf.length} bytes from Twilio`);
 
+  // Write to temp
   const tmp = path.join(os.tmpdir(), `vm-${crypto.randomUUID()}.mp3`);
   fs.writeFileSync(tmp, buf);
 
+  // Reusable IPv4/no-keepalive agent to avoid flaky sockets
+  const ipv4Agent = new https.Agent({ keepAlive: false, family: 4 });
+
   const MAX = 5;
   let attempt = 0;
+
   try {
     while (attempt < MAX) {
       attempt++;
       try {
-        console.log(`[transcribe] attempt ${attempt}/${MAX}`);
+        console.log(`[transcribe] SDK attempt ${attempt}/${MAX}`);
+        // 2) First try: OpenAI SDK
         const tr = await openai.audio.transcriptions.create({
           file: fs.createReadStream(tmp),
           model: "whisper-1"
         });
         const text = tr.text || "";
-        console.log(`[transcribe] success (len=${text.length})`);
+        console.log(`[transcribe] SDK success (len=${text.length})`);
         return text;
-      } catch (err) {
-        const msg = err?.message || String(err);
-        const transient =
-          err instanceof APIConnectionError ||
-          msg.includes("ECONNRESET") ||
-          msg.includes("ETIMEDOUT") ||
-          msg.toLowerCase().includes("timeout") ||
-          msg.includes("socket hang up");
 
-        console.warn(`[transcribe] error: ${msg} (transient=${transient})`);
+      } catch (sdkErr) {
+        const msg = sdkErr?.message || String(sdkErr);
+        console.warn(`[transcribe] SDK error: ${msg}`);
 
-        if (!transient || attempt >= MAX) {
-          throw err; // give up (your /voicemail-complete already skips DB write on failure)
+        // 3) Fallback: raw multipart POST via node-fetch + form-data + IPv4 agent
+        try {
+          console.log(`[transcribe] Fallback attempt ${attempt}/${MAX}`);
+          const form = new FormData();
+          form.append("model", "whisper-1");
+          form.append("file", fs.createReadStream(tmp), {
+            filename: "audio.mp3",
+            contentType: "audio/mpeg"
+          });
+
+          const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${OPENAI_API_KEY}`,
+              ...form.getHeaders()
+            },
+            body: form,
+            // Force IPv4 and disable keep-alive to dodge ECONNRESET on some hosts
+            agent: ipv4Agent
+          });
+
+          if (!r.ok) {
+            const body = await r.text().catch(() => "");
+            throw new Error(`Fallback HTTP ${r.status}: ${body.slice(0, 200)}`);
+          }
+          const json = await r.json();
+          const text = json?.text || "";
+          console.log(`[transcribe] Fallback success (len=${text.length})`);
+          return text;
+
+        } catch (fallbackErr) {
+          const fmsg = fallbackErr?.message || String(fallbackErr);
+          const transient =
+            fmsg.includes("ECONNRESET") ||
+            fmsg.includes("ETIMEDOUT") ||
+            fmsg.toLowerCase().includes("timeout") ||
+            fmsg.includes("socket hang up");
+
+          console.warn(`[transcribe] Fallback error: ${fmsg} (transient=${transient})`);
+          if (!transient || attempt >= MAX) throw fallbackErr;
+
+          const delay = 700 * Math.pow(2, attempt - 1); // 0.7s, 1.4s, 2.8s, 5.6s, 11.2s
+          await new Promise(r => setTimeout(r, delay));
         }
-        const delay = 700 * Math.pow(2, attempt - 1); // 0.7s, 1.4s, 2.8s, 5.6s
-        await new Promise(r => setTimeout(r, delay));
       }
     }
     throw new Error("transcribe: exhausted retries");
@@ -120,6 +164,7 @@ async function transcribeFromUrl(mp3Url) {
     fs.unlink(tmp, () => {});
   }
 }
+
 
 
 
