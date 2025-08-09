@@ -41,7 +41,7 @@ app.use(express.json());
 function basicTwiml(greetingText) {
   const g = greetingText && greetingText.trim()
     ? greetingText
-    : "Hi! You’ve reached our AI receptionist. Please leave a message after the tone.";
+    : "Hi! You’ve reached Kyle's AI receptionist. Please leave a message after the tone.";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>${g}</Say>
