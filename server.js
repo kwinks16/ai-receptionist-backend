@@ -24,7 +24,7 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OPENAI_API_KEY) {
 }
 
 const app = express();
-app.use(express.urlencoded({ extended: true })); // Twilio webhooks (form-encoded)
+app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
 app.use(express.json());
 
 const firestore = new Firestore();
@@ -32,7 +32,7 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioBasicAuth =
   "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
 
-// ---- helpers ----
+// ---------- helpers ----------
 function summarize(text = "") {
   const t = text.trim();
   if (!t) return "";
@@ -41,7 +41,7 @@ function summarize(text = "") {
 }
 
 async function transcribeFromUrl(mp3Url) {
-  // Download Twilio recording with basic auth
+  // Download Twilio recording with basic auth (recordings are protected)
   const res = await fetch(mp3Url, { headers: { Authorization: twilioBasicAuth } });
   if (!res.ok) throw new Error(`Audio download failed ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
@@ -60,28 +60,36 @@ async function transcribeFromUrl(mp3Url) {
   }
 }
 
-// ---- voice webhook: immediate greet + record ----
-app.post("/voice", (req, res) => {
+// Build TwiML for both GET and POST /voice
+function buildTwiml(req) {
   const greeting =
-    req.query.greeting ||
+    (req.query && req.query.greeting) ||
     "Hi! You’ve reached our AI receptionist. Please leave a message after the tone.";
 
-  // Derive base URL if PUBLIC_BASE_URL not set yet
+  // Derive base URL if PUBLIC_BASE_URL isn't set yet
   const proto = (req.headers["x-forwarded-proto"] || "https").toString();
   const host = req.headers.host;
   const baseUrl = PUBLIC_BASE_URL || `${proto}://${host}`;
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>${greeting}</Say>
   <Record playBeep="true" maxLength="120" recordingStatusCallback="${baseUrl}/voicemail-complete" />
   <Say>No recording received. Goodbye.</Say>
   <Hangup/>
 </Response>`;
-  res.type("text/xml").send(twiml);
+}
+
+// ---------- voice webhooks (immediate greet + record) ----------
+app.get("/voice", (req, res) => {
+  res.type("text/xml").send(buildTwiml(req));
 });
 
-// ---- Twilio calls this after recording completes ----
+app.post("/voice", (req, res) => {
+  res.type("text/xml").send(buildTwiml(req));
+});
+
+// Twilio posts here after recording completes
 app.post("/voicemail-complete", async (req, res) => {
   try {
     const { RecordingUrl, From, To, CallSid, Caller, Timestamp } = req.body;
@@ -107,12 +115,12 @@ app.post("/voicemail-complete", async (req, res) => {
     res.sendStatus(200);
   } catch (e) {
     console.error("voicemail-complete error:", e);
-    // Return 200 to avoid Twilio retries; we logged the error.
+    // Return 200 to avoid Twilio retry storms; we logged the error
     res.sendStatus(200);
   }
 });
 
-// ---- simple health/data endpoints ----
+// ---------- simple health/data endpoints ----------
 app.get("/api/voicemails", async (req, res) => {
   const snap = await firestore
     .collection(FIRESTORE_COLLECTION)
