@@ -35,7 +35,7 @@ function basicTwiml(greetingText) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>${g}</Say>
-  <Record playBeep="true" maxLength="60" recordingStatusCallback="/voicemail-complete" />
+  <Record playBeep="true" maxLength="30" recordingStatusCallback="/voicemail-complete" />
   <Say>No recording received. Goodbye.</Say>
   <Hangup/>
 </Response>`;
@@ -53,8 +53,10 @@ app.post("/voice", (req, res) => {
 const firestore = new Firestore();
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
-  timeout: 60000 // 60s
+  timeout: 60000,
+  maxRetries: 2
 });
+
 const twilioBasicAuth =
   "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
 
@@ -67,47 +69,46 @@ function summarize(text = "") {
 }
 
 async function transcribeFromUrl(mp3Url) {
-  // Download Twilio recording with basic auth
+  // Download Twilio recording with basic auth (protected URL)
   const res = await fetch(mp3Url, { headers: { Authorization: twilioBasicAuth } });
   if (!res.ok) throw new Error(`Audio download failed ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
+  console.log(`[transcribe] downloaded ${buf.length} bytes from Twilio`);
 
-  // Write to a temp file
+  // Write to temp, then stream to OpenAI Whisper
   const tmp = path.join(os.tmpdir(), `vm-${crypto.randomUUID()}.mp3`);
   fs.writeFileSync(tmp, buf);
 
-  const maxAttempts = 3;
-  let attempt = 0, lastErr;
-
+  const MAX = 5;
+  let attempt = 0;
   try {
-    while (attempt < maxAttempts) {
+    while (attempt < MAX) {
       attempt++;
       try {
+        console.log(`[transcribe] attempt ${attempt}/${MAX}`);
         const tr = await openai.audio.transcriptions.create({
           file: fs.createReadStream(tmp),
           model: "whisper-1"
         });
-        return tr.text || "";
+        const text = tr.text || "";
+        console.log(`[transcribe] success (len=${text.length})`);
+        return text;
       } catch (err) {
-        lastErr = err;
-        // ECONNRESET / timeouts → retry
         const msg = (err && err.message) ? err.message : String(err);
-        const isTransient =
+        const code = err?.code || "";
+        const transient =
           msg.includes("ECONNRESET") ||
           msg.includes("ETIMEDOUT") ||
-          msg.includes("timeout") ||
+          msg.toLowerCase().includes("timeout") ||
           msg.includes("socket hang up") ||
-          (err && err.code === "ECONNRESET");
-
-        if (!isTransient || attempt >= maxAttempts) {
-          throw err;
-        }
-        const delay = 500 * Math.pow(2, attempt - 1); // 500ms, 1000ms, 2000ms
-        console.warn(`Whisper retry ${attempt}/${maxAttempts} in ${delay}ms… (${msg})`);
+          code === "ECONNRESET";
+        console.warn(`[transcribe] error: ${msg} (transient=${transient})`);
+        if (!transient || attempt >= MAX) throw err;
+        const delay = 700 * Math.pow(2, attempt - 1); // 0.7s, 1.4s, 2.8s, 5.6s, 11.2s
         await new Promise(r => setTimeout(r, delay));
       }
     }
-    throw lastErr || new Error("Unknown transcription error");
+    throw new Error("transcribe: exhausted retries");
   } finally {
     fs.unlink(tmp, () => {});
   }
@@ -128,7 +129,7 @@ function buildTwiml(req) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>${greeting}</Say>
-  <Record playBeep="true" maxLength="120" recordingStatusCallback="${baseUrl}/voicemail-complete" />
+  <Record playBeep="true" maxLength="30" recordingStatusCallback="/voicemail-complete" />
   <Say>No recording received. Goodbye.</Say>
   <Hangup/>
 </Response>`;
