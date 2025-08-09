@@ -167,6 +167,25 @@ app.post("/voicemail-complete", async (req, res) => {
   }
 });
 
+app.get("/test-firestore", async (req, res) => {
+  try {
+    const docRef = firestore.collection(FIRESTORE_COLLECTION).doc();
+    await docRef.set({
+      callerName: "Test Caller",
+      phone: "+15555555555",
+      time: new Date(),
+      summary: "This is a test voicemail entry.",
+      transcript: "Hi, this is just a test to confirm Firestore is connected.",
+      isNew: true
+    });
+    res.send(`Test voicemail saved with ID: ${docRef.id}`);
+  } catch (err) {
+    console.error("Firestore test error:", err);
+    res.status(500).send("Error writing to Firestore");
+  }
+});
+
+
 // ---------- simple health/data endpoints ----------
 app.get("/api/voicemails", async (req, res) => {
   const snap = await firestore
