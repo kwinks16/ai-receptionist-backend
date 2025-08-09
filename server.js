@@ -27,6 +27,29 @@ const app = express();
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
 app.use(express.json());
 
+// --- ultra-stable /voice handlers (no deps) ---
+function basicTwiml(greetingText) {
+  const g = greetingText && greetingText.trim()
+    ? greetingText
+    : "Hi! You’ve reached our AI receptionist. Please leave a message after the tone.";
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>${g}</Say>
+  <Record playBeep="true" maxLength="60" recordingStatusCallback="/voicemail-complete" />
+  <Say>No recording received. Goodbye.</Say>
+  <Hangup/>
+</Response>`;
+}
+
+app.get("/voice", (req, res) => {
+  res.type("text/xml").status(200).send(basicTwiml(req.query.greeting));
+});
+
+app.post("/voice", (req, res) => {
+  res.type("text/xml").status(200).send(basicTwiml(req.query.greeting));
+});
+
+
 const firestore = new Firestore();
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
@@ -112,13 +135,6 @@ function buildTwiml(req) {
 }
 
 // ---------- voice webhooks (immediate greet + record) ----------
-app.get("/voice", (req, res) => {
-  res.type("text/xml").send(buildTwiml(req));
-});
-
-app.post("/voice", (req, res) => {
-  res.type("text/xml").send(buildTwiml(req));
-});
 
 // Twilio posts here after recording completes
 app.post("/voicemail-complete", async (req, res) => {
