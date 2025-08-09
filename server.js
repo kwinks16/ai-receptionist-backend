@@ -28,7 +28,10 @@ app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-en
 app.use(express.json());
 
 const firestore = new Firestore();
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+  timeout: 60000 // 60s
+});
 const twilioBasicAuth =
   "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
 
