@@ -83,12 +83,49 @@ const twilioBasicAuth =
   "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
 
 // ---------- helpers ----------
-function summarize(text = "") {
-  const t = text.trim();
+// Old extractive fallback (kept as last-resort)
+function fallbackSummary(text = "") {
+  const t = (text || "").trim();
   if (!t) return "";
-  const i = t.indexOf(".");
-  return i >= 30 ? t.slice(0, i + 1) : t.slice(0, 140);
+  const firstPeriod = t.indexOf(".");
+  if (firstPeriod >= 40) return t.slice(0, firstPeriod + 1);
+  return t.slice(0, 180);
 }
+
+// True abstractive summary via OpenAI (short, caller-facing)
+async function generateSummary(transcript, { tries = 3 } = {}) {
+  if (!transcript || !transcript.trim()) return "";
+
+  const system = "You are a helpful call assistant. Summarize the caller's voicemail in one crisp sentence (max ~30 words). Include the caller's intent and any date/time/request details. No preamble.";
+  const user = `Voicemail transcript:\n"""${transcript}"""\n\nReturn just the summary sentence.`;
+
+  let lastErr;
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",        // inexpensive + good for short summaries
+        temperature: 0.2,
+        max_tokens: 80,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ],
+      });
+      const out = resp.choices?.[0]?.message?.content?.trim() || "";
+      if (out) return out;
+      lastErr = new Error("Empty summary");
+    } catch (e) {
+      lastErr = e;
+      const msg = e?.message || String(e);
+      const transient = /ECONNRESET|ETIMEDOUT|timeout|socket hang up|rate limit|429/i.test(msg);
+      if (!transient || attempt === tries) break;
+      await new Promise(r => setTimeout(r, 600 * Math.pow(2, attempt - 1))); // 0.6s, 1.2s, 2.4s
+    }
+  }
+  console.warn("generateSummary fallback due to error:", lastErr?.message || lastErr);
+  return fallbackSummary(transcript);
+}
+
 
 function cleanedDoc(obj) {
   const dropped = [];
@@ -242,6 +279,8 @@ app.post("/voicemail-complete", async (req, res) => {
 
     const col = process.env.FIRESTORE_COLLECTION || "voicemails";
     const id = crypto.randomUUID();
+    
+    const summary = await generateSummary(transcript);
 
     const doc = {
       id,
