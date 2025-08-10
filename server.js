@@ -287,7 +287,7 @@ app.post("/voicemail-complete", async (req, res) => {
       callerName: Caller || "Unknown",
       phone: From || "Unknown",
       time: Timestamp ? new Date(Timestamp) : new Date(),
-      summary: summarize(transcript),
+      summary,
       transcript,
       isNew: true,
       recordingUrl: mp3Url,
