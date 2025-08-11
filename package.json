@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": { "start": "node server.js" },
-  "dependencies": {
-    "@google-cloud/firestore": "^7.7.0",
+ "dependencies": {
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "openai": "^4.52.0",
-    "form-data": "^4.0.0"
+    "openai": "^4.57.0",
+    "@google-cloud/firestore": "^7.10.0",
+    "ws": "^8.18.0",
+    "mulaw": "^2.0.0",
+    "pcm-resampler": "^1.2.0"
   }
 }
