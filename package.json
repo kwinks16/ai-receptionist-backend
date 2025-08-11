@@ -8,6 +8,6 @@
     "node-fetch": "^3.3.2",
     "openai": "^4.57.0",
     "@google-cloud/firestore": "^7.10.0",
-    "ws": "^8.18.0",
+    "ws": "^8.18.0"
   }
 }
