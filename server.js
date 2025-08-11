@@ -7,323 +7,170 @@ import crypto from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { APIConnectionError } from "openai";
-
-
-import https from "https";
-import dns from "dns";
-import FormData from "form-data";
-
-dns.setDefaultResultOrder("ipv4first");
-
-
+import http from "http";
+import { WebSocketServer } from "ws";
+import { encode as muLawEncode, decode as muLawDecode } from "mulaw";
+import Resampler from "pcm-resampler";
 
 const {
   PORT = 3000,
-  PUBLIC_BASE_URL,                 // optional; we can derive from request
+  PUBLIC_BASE_URL,
+  PUBLIC_WS_URL,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   OPENAI_API_KEY,
   FIRESTORE_COLLECTION = "voicemails",
+  GREETING_TEXT = "Hi! You've reached our AI receptionist. Please leave a message after the beep."
 } = process.env;
 
-// Required envs (PUBLIC_BASE_URL is optional on first deploy)
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OPENAI_API_KEY) {
-  console.error("Missing env: need TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY.");
+  console.error("Missing env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, OPENAI_API_KEY.");
   process.exit(1);
 }
 
 const app = express();
-app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
+app.use(express.urlencoded({ extended: true })); // Twilio webhooks: form-encoded
 app.use(express.json());
 
-app.get("/health-firestore", async (req, res) => {
-  try {
-    const col = process.env.FIRESTORE_COLLECTION || "voicemails";
-    const snap = await firestore.collection(col).orderBy("time", "desc").limit(1).get();
-    res.json({ ok: true, collection: col, docsFound: snap.size, lastId: snap.docs[0]?.id || null });
-  } catch (err) {
-    console.error("Firestore health error:", err);
-    res.status(500).json({ ok: false, error: String(err?.message || err) });
-  }
-});
-
-
-// --- ultra-stable /voice handlers (no deps) ---
-function basicTwiml(greetingText) {
-  const g = greetingText && greetingText.trim()
-    ? greetingText
-    : "Hi! You’ve reached Kyle's AI receptionist. Please leave a message after the tone.";
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>${g}</Say>
-  <Record playBeep="true" maxLength="30" recordingStatusCallback="/voicemail-complete" />
-  <Say>No recording received. Goodbye.</Say>
-  <Hangup/>
-</Response>`;
-}
-
-app.get("/voice", (req, res) => {
-  res.type("text/xml").status(200).send(basicTwiml(req.query.greeting));
-});
-
-app.post("/voice", (req, res) => {
-  res.type("text/xml").status(200).send(basicTwiml(req.query.greeting));
-});
-
-
-const firestore = new Firestore({ ignoreUndefinedProperties: true });
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-  timeout: 60000,
-  maxRetries: 2
-});
-
-const twilioBasicAuth =
-  "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+const firestore = new Firestore();
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY, timeout: 60000 });
 
 // ---------- helpers ----------
-// Old extractive fallback (kept as last-resort)
-function fallbackSummary(text = "") {
-  const t = (text || "").trim();
+function summarize(text = "") {
+  const t = text.trim();
   if (!t) return "";
-  const firstPeriod = t.indexOf(".");
-  if (firstPeriod >= 40) return t.slice(0, firstPeriod + 1);
-  return t.slice(0, 180);
+  const i = t.indexOf(".");
+  return i >= 30 ? t.slice(0, i + 1) : t.slice(0, 180);
 }
 
-// True abstractive summary via OpenAI (short, caller-facing)
-async function generateSummary(transcript, { tries = 3 } = {}) {
-  if (!transcript || !transcript.trim()) return "";
+async function downloadToTmp(url, authUser, authPass) {
+  const tmp = path.join(os.tmpdir(), `rec-${crypto.randomBytes(6).toString("hex")}.mp3`);
+  const resp = await fetch(url, {
+    headers: { Authorization: "Basic " + Buffer.from(`${authUser}:${authPass}`).toString("base64") }
+  });
+  if (!resp.ok) throw new Error(`download failed: ${resp.status}`);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  await fs.promises.writeFile(tmp, buf);
+  return { path: tmp, size: buf.length };
+}
 
-  const system = "You are a helpful call assistant. Summarize the caller's voicemail in one crisp sentence (max ~30 words). Include the caller's intent and any date/time/request details. No preamble.";
-  const user = `Voicemail transcript:\n"""${transcript}"""\n\nReturn just the summary sentence.`;
+async function transcribeFromUrl(recordingUrl) {
+  // Download with Twilio Basic auth, save temp file
+  const { path: tmpPath, size } = await downloadToTmp(recordingUrl, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+  console.log(`[transcribe] downloaded ${size} bytes from Twilio`);
 
+  // Try SDK first, then a direct fetch if needed
   let lastErr;
-  for (let attempt = 1; attempt <= tries; attempt++) {
+  for (let i = 1; i <= 5; i++) {
     try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",        // inexpensive + good for short summaries
-        temperature: 0.2,
-        max_tokens: 80,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user }
-        ],
+      console.log(`[transcribe] SDK attempt ${i}/5`);
+      const file = fs.createReadStream(tmpPath);
+      const r = await openai.audio.transcriptions.create({
+        file,
+        model: "whisper-1" // use Whisper
       });
-      const out = resp.choices?.[0]?.message?.content?.trim() || "";
-      if (out) return out;
-      lastErr = new Error("Empty summary");
+      await fs.promises.unlink(tmpPath).catch(() => {});
+      return r.text?.trim() || "";
     } catch (e) {
       lastErr = e;
-      const msg = e?.message || String(e);
-      const transient = /ECONNRESET|ETIMEDOUT|timeout|socket hang up|rate limit|429/i.test(msg);
-      if (!transient || attempt === tries) break;
-      await new Promise(r => setTimeout(r, 600 * Math.pow(2, attempt - 1))); // 0.6s, 1.2s, 2.4s
+      const transient = /ECONNRESET|ETIMEDOUT|ENOTFOUND/.test(String(e?.message || e));
+      console.log(`[transcribe] SDK error: ${e?.message || e} (transient=${transient})`);
+      if (!transient) break;
+      await new Promise(r => setTimeout(r, 800 * i));
     }
   }
-  console.warn("generateSummary fallback due to error:", lastErr?.message || lastErr);
-  return fallbackSummary(transcript);
+  await fs.promises.unlink(tmpPath).catch(() => {});
+  throw lastErr || new Error("transcription failed");
 }
 
-
-function cleanedDoc(obj) {
-  const dropped = [];
-  const out = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (v === undefined) { 
-      dropped.push(k); 
-      continue; 
-    }
-    out[k] = v;
-  }
-  if (dropped.length) {
-    console.warn("[vm] dropped undefined fields:", dropped.join(", "));
-  }
-  return out;
+function nowIso() {
+  return new Date().toISOString();
 }
 
+// -------------------------------------------------------------
+// HEALTH
+// -------------------------------------------------------------
+app.get("/", (_req, res) => res.send("OK"));
+app.get("/healthz", (_req, res) => res.json({ ok: true, t: nowIso() }));
 
-async function transcribeFromUrl(mp3Url) {
-  // 1) Download Twilio audio (protected) over basic auth
-  const res = await fetch(mp3Url, { headers: { Authorization: twilioBasicAuth } });
-  if (!res.ok) throw new Error(`Audio download failed ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  console.log(`[transcribe] downloaded ${buf.length} bytes from Twilio`);
+// -------------------------------------------------------------
+// VOICE: Plain voicemail flow (what you already had)
+//   Twilio → /voice → plays greeting, records → /voicemail-complete
+// -------------------------------------------------------------
+app.post("/voice", (req, res) => {
+  const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
+  const actionUrl = `${base}/voicemail-complete`;
+  const greet = (req.body?.GreetingText || GREETING_TEXT).toString();
 
-  // Write to temp
-  const tmp = path.join(os.tmpdir(), `vm-${crypto.randomUUID()}.mp3`);
-  fs.writeFileSync(tmp, buf);
+  const twiml = `
+    <Response>
+      <Say voice="Polly.Joanna">${greet}</Say>
+      <Pause length="1"/>
+      <Say>Please leave your message after the tone. Press any key to finish.</Say>
+      <Record action="${actionUrl}" method="POST" maxLength="90" finishOnKey="*" playBeep="true" />
+      <Say>We didn't receive a recording. Goodbye.</Say>
+    </Response>`;
+  res.type("text/xml").send(twiml);
+});
 
-  // Reusable IPv4/no-keepalive agent to avoid flaky sockets
-  const ipv4Agent = new https.Agent({ keepAlive: false, family: 4 });
-
-  const MAX = 5;
-  let attempt = 0;
-
-  try {
-    while (attempt < MAX) {
-      attempt++;
-      try {
-        console.log(`[transcribe] SDK attempt ${attempt}/${MAX}`);
-        // 2) First try: OpenAI SDK
-        const tr = await openai.audio.transcriptions.create({
-          file: fs.createReadStream(tmp),
-          model: "whisper-1"
-        });
-        const text = tr.text || "";
-        console.log(`[transcribe] SDK success (len=${text.length})`);
-        return text;
-
-      } catch (sdkErr) {
-        const msg = sdkErr?.message || String(sdkErr);
-        console.warn(`[transcribe] SDK error: ${msg}`);
-
-        // 3) Fallback: raw multipart POST via node-fetch + form-data + IPv4 agent
-        try {
-          console.log(`[transcribe] Fallback attempt ${attempt}/${MAX}`);
-          const form = new FormData();
-          form.append("model", "whisper-1");
-          form.append("file", fs.createReadStream(tmp), {
-            filename: "audio.mp3",
-            contentType: "audio/mpeg"
-          });
-
-          const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${OPENAI_API_KEY}`,
-              ...form.getHeaders()
-            },
-            body: form,
-            // Force IPv4 and disable keep-alive to dodge ECONNRESET on some hosts
-            agent: ipv4Agent
-          });
-
-          if (!r.ok) {
-            const body = await r.text().catch(() => "");
-            throw new Error(`Fallback HTTP ${r.status}: ${body.slice(0, 200)}`);
-          }
-          const json = await r.json();
-          const text = json?.text || "";
-          console.log(`[transcribe] Fallback success (len=${text.length})`);
-          return text;
-
-        } catch (fallbackErr) {
-          const fmsg = fallbackErr?.message || String(fallbackErr);
-          const transient =
-            fmsg.includes("ECONNRESET") ||
-            fmsg.includes("ETIMEDOUT") ||
-            fmsg.toLowerCase().includes("timeout") ||
-            fmsg.includes("socket hang up");
-
-          console.warn(`[transcribe] Fallback error: ${fmsg} (transient=${transient})`);
-          if (!transient || attempt >= MAX) throw fallbackErr;
-
-          const delay = 700 * Math.pow(2, attempt - 1); // 0.7s, 1.4s, 2.8s, 5.6s, 11.2s
-          await new Promise(r => setTimeout(r, delay));
-        }
-      }
-    }
-    throw new Error("transcribe: exhausted retries");
-  } finally {
-    fs.unlink(tmp, () => {});
-  }
-}
-
-
-
-
-// Build TwiML for both GET and POST /voice
-function buildTwiml(req) {
-  const greeting =
-    (req.query && req.query.greeting) ||
-    "Hi! You’ve reached our AI receptionist. Please leave a message after the tone.";
-
-  // Derive base URL if PUBLIC_BASE_URL isn't set yet
-  const proto = (req.headers["x-forwarded-proto"] || "https").toString();
-  const host = req.headers.host;
-  const baseUrl = PUBLIC_BASE_URL || `${proto}://${host}`;
-
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>${greeting}</Say>
-  <Record playBeep="true" maxLength="30" recordingStatusCallback="/voicemail-complete" />
-  <Say>No recording received. Goodbye.</Say>
-  <Hangup/>
-</Response>`;
-}
-
-// ---------- voice webhooks (immediate greet + record) ----------
-
-// Twilio posts here after recording completes
 app.post("/voicemail-complete", async (req, res) => {
-  const { RecordingUrl, From, To, CallSid, Caller, Timestamp } = req.body;
-  console.log(`[vm] callback: CallSid=${CallSid} From=${From} To=${To} RecordingUrl=${RecordingUrl}`);
-
+  // Twilio sends: RecordingUrl, From, To, CallSid, Timestamp, etc.
   try {
-    if (!RecordingUrl) {
-      console.warn("[vm] no RecordingUrl in callback, ignoring");
-      return res.sendStatus(200);
+    const recordingUrl = (req.body?.RecordingUrl || "").toString();
+    const from = (req.body?.From || "").toString();
+    const to = (req.body?.To || "").toString();
+    const callSid = (req.body?.CallSid || "").toString();
+
+    console.log(`[vm] callback: CallSid=${callSid} From=${from || "undefined"} To=${to || "undefined"} RecordingUrl=${recordingUrl}`);
+
+    if (!recordingUrl) { res.type("text/xml").send("<Response/>"); return; }
+
+    const transcript = await transcribeFromUrl(`${recordingUrl}.mp3`);
+    console.log(`[vm] transcript length=${transcript.length}`);
+
+    // lightweight summary
+    const summary = summarize(transcript);
+
+    // only write if we have transcript
+    if (transcript && transcript.length > 0) {
+      const doc = {
+        id: callSid || crypto.randomUUID(),
+        phone: from || "Unknown",
+        callerName: "Unknown",
+        time: Date.now() / 1000, // epoch seconds for safe decoding on iOS
+        summary,
+        transcript,
+        isNew: true,
+        recordingUrl: `${recordingUrl}.mp3`
+      };
+      console.log("[vm] writing doc to Firestore…");
+      await firestore.collection(FIRESTORE_COLLECTION).doc(doc.id).set(doc, { merge: true });
+    } else {
+      console.log("[vm] no transcript; skipping write");
     }
 
-    const mp3Url = `${RecordingUrl}.mp3`;
-    const transcript = await transcribeFromUrl(mp3Url);
-    console.log(`[vm] transcript length=${(transcript || "").length}`);
-
-    // Only save when we have transcript text (your preference)
-    if (!transcript || !transcript.trim()) {
-      console.warn("[vm] empty transcript; not saving to Firestore");
-      return res.sendStatus(200);
-    }
-
-    const col = process.env.FIRESTORE_COLLECTION || "voicemails";
-    const id = crypto.randomUUID();
-    
-    const summary = await generateSummary(transcript);
-
-    const doc = {
-      id,
-      callerName: Caller || "Unknown",
-      phone: From || "Unknown",
-      time: Timestamp ? new Date(Timestamp) : new Date(),
-      summary,
-      transcript,
-      isNew: true,
-      recordingUrl: mp3Url,
-      callSid: CallSid || null,
-      to: To || null
-    };
-
-    console.log("[vm] writing doc to Firestore…");
-    await firestore.collection(col).doc(id).set(cleanedDoc(doc));
-    console.log(`[vm] saved: collection=${col} id=${id}`);
-    res.sendStatus(200);
-
+    res.type("text/xml").send("<Response/>");
   } catch (e) {
-    console.error("[vm] error (no write):", e?.message || e);
-    // Return 200 so Twilio doesn't spam retries
-    res.sendStatus(200);
+    console.error("voicemail-complete error:", e);
+    res.type("text/xml").send("<Response/>"); // always 200 to Twilio
   }
 });
 
-// ---- Q&A from Business FAQ (grounded, no web) ----
+// -------------------------------------------------------------
+// Q&A endpoint (grounded in Business FAQ only; used by app)
+// -------------------------------------------------------------
 app.post("/qa", async (req, res) => {
   try {
     const { question, faq, businessName } = req.body || {};
-    if (!question || !faq) {
-      return res.status(400).json({ error: "Missing 'question' or 'faq'." });
-    }
+    if (!question || !faq) return res.status(400).json({ error: "Missing 'question' or 'faq'." });
 
-    const biz = (businessName || "").trim();
     const system = [
       "You are an AI receptionist for a small business.",
-      "Answer *only* using the provided Knowledge Base.",
-      "If the answer is not contained there, say you don't have that information and suggest leaving a message or checking back.",
-      "Be concise (1–3 sentences), friendly, and accurate. Do not invent facts.",
+      "Answer only using the provided Knowledge Base.",
+      "If the answer is not in the KB, say you don't have that info and suggest leaving a message or checking back.",
+      "Be concise (1–3 sentences), friendly, and accurate. Do not invent facts."
     ].join(" ");
-
-    const kbHeader = biz ? `Business: ${biz}\n` : "";
+    const kbHeader = businessName ? `Business: ${businessName}\n` : "";
     const user = `${kbHeader}Knowledge Base (Q/A format):\n---\n${faq}\n---\n\nQuestion: ${question}`;
 
     const resp = await openai.chat.completions.create({
@@ -333,58 +180,143 @@ app.post("/qa", async (req, res) => {
       messages: [
         { role: "system", content: system },
         { role: "user", content: user }
-      ],
+      ]
     });
 
-    const answer = resp.choices?.[0]?.message?.content?.trim() || "Sorry—I don’t have that information in the knowledge base.";
-    return res.json({ answer });
+    const answer = resp.choices?.[0]?.message?.content?.trim()
+      || "Sorry—I don't have that information in the knowledge base.";
+    res.json({ answer });
   } catch (e) {
     console.error("/qa error:", e?.message || e);
-    return res.status(500).json({ error: "QA failed" });
+    res.status(500).json({ error: "QA failed" });
   }
 });
 
-//------------- test firestore connection ---------------
-app.get("/test-firestore", async (req, res) => {
+// -------------------------------------------------------------
+// INBOX: simple read API for the iOS app
+// -------------------------------------------------------------
+app.get("/api/voicemails", async (_req, res) => {
   try {
-    const docRef = firestore.collection(FIRESTORE_COLLECTION).doc();
-    await docRef.set({
-      callerName: "Test Caller",
-      phone: "+15555555555",
-      time: new Date(),
-      summary: "This is a test voicemail entry.",
-      transcript: "Hi, this is just a test to confirm Firestore is connected.",
-      isNew: true
-    });
-    res.send(`Test voicemail saved with ID: ${docRef.id}`);
-  } catch (err) {
-    console.error("Firestore test error:", err);
-    res.status(500).send("Error writing to Firestore");
-  }
-});
-
-// ----------- test openai connection ---------------
-app.get("/health-openai", async (req, res) => {
-  try {
-    // a tiny call that hits OpenAI but doesn't cost anything significant
-    const list = await openai.models.list({ limit: 1 });
-    res.json({ ok: true, modelsSeen: list.data?.length ?? 0 });
+    const snap = await firestore.collection(FIRESTORE_COLLECTION)
+      .orderBy("time", "desc").limit(50).get();
+    res.json(snap.docs.map(d => d.data()));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+    res.status(500).json({ error: "fetch failed" });
   }
 });
 
+// -------------------------------------------------------------
+// REALTIME AI: Twilio <Stream> ↔ OpenAI Realtime proxy
+// -------------------------------------------------------------
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
 
-// ---------- simple health/data endpoints ----------
-app.get("/api/voicemails", async (req, res) => {
-  const snap = await firestore
-    .collection(FIRESTORE_COLLECTION)
-    .orderBy("time", "desc")
-    .limit(50)
-    .get();
-  res.json(snap.docs.map((d) => d.data()));
+server.on("upgrade", (req, socket, head) => {
+  if (req.url?.startsWith("/twilio-media")) {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else {
+    socket.destroy();
+  }
 });
 
-app.get("/", (req, res) => res.send("AI Receptionist backend up."));
+// TwiML to start the bidirectional media stream
+app.post("/voice-realtime", (req, res) => {
+  const wsUrl = (PUBLIC_WS_URL && PUBLIC_WS_URL.trim())
+    ? PUBLIC_WS_URL.trim()
+    : `wss://${req.headers.host}/twilio-media`;
+  const twiml = `
+    <Response>
+      <Say voice="Polly.Joanna">Connecting you. One moment please.</Say>
+      <Connect>
+        <Stream url="${wsUrl}" />
+      </Connect>
+    </Response>`;
+  res.type("text/xml").send(twiml);
+});
 
-app.listen(PORT, () => console.log(`Server on :${PORT}`));
+// Proxy media between Twilio and OpenAI Realtime
+wss.on("connection", async (twilioWs) => {
+  const RealtimeWS = (await import("ws")).default;
+  const modelUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview";
+  const openaiWs = new RealtimeWS(modelUrl, {
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+  });
+
+  // Configure session (ask for audio I/O)
+  openaiWs.on("open", () => {
+    openaiWs.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        input_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
+        output_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
+        instructions:
+          "You are a live AI receptionist. Be concise, friendly, and professional. If business knowledge is provided later, use only that. If unsure, ask a brief follow-up or offer to take a message. Do not browse the web."
+      }
+    }));
+  });
+
+  // Resamplers
+  const up = new Resampler({ inputSampleRate: 8000, outputSampleRate: 24000, channels: 1 });
+  const down = new Resampler({ inputSampleRate: 24000, outputSampleRate: 8000, channels: 1 });
+
+  function twilioChunkToPcm24k(base64) {
+    const u8 = Buffer.from(base64, "base64");
+    const pcm8k = muLawDecode(u8); // Int16Array
+    const pcm24 = up.resample(Int16Array.from(pcm8k));
+    return Buffer.from(new Int16Array(pcm24).buffer);
+  }
+  function pcm24kToTwilioMuLawBase64(buf) {
+    const int16 = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
+    const pcm8k = down.resample(int16);
+    const mu = muLawEncode(Int16Array.from(pcm8k));
+    return Buffer.from(mu).toString("base64");
+  }
+
+  // Twilio → OpenAI (caller speech)
+  twilioWs.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.event === "media" && msg.media?.payload) {
+        const pcm24 = twilioChunkToPcm24k(msg.media.payload);
+        openaiWs.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: pcm24.toString("base64")
+        }));
+      } else if (msg.event === "start") {
+        // new call started
+      }
+    } catch {}
+  });
+
+  // Periodically commit audio for response
+  const iv = setInterval(() => {
+    if (openaiWs.readyState === openaiWs.OPEN) {
+      openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      openaiWs.send(JSON.stringify({ type: "response.create" }));
+    }
+  }, 1200);
+
+  // OpenAI → Twilio (assistant speech)
+  openaiWs.on("message", (raw) => {
+    try {
+      const evt = JSON.parse(raw.toString());
+      if (evt.type === "response.output_audio.delta" && evt.delta?.audio) {
+        const base64Mu = pcm24kToTwilioMuLawBase64(Buffer.from(evt.delta.audio, "base64"));
+        twilioWs.send(JSON.stringify({ event: "media", media: { payload: base64Mu } }));
+      }
+    } catch {}
+  });
+
+  const cleanup = () => { clearInterval(iv); try { openaiWs.close(); } catch {} try { twilioWs.close(); } catch {} };
+  twilioWs.on("close", cleanup);
+  twilioWs.on("error", cleanup);
+  openaiWs.on("close", cleanup);
+  openaiWs.on("error", cleanup);
+});
+
+// -------------------------------------------------------------
+// START
+// -------------------------------------------------------------
+server.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
+});
