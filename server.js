@@ -307,7 +307,42 @@ app.post("/voicemail-complete", async (req, res) => {
   }
 });
 
+// ---- Q&A from Business FAQ (grounded, no web) ----
+app.post("/qa", requireApiKey, async (req, res) => {
+  try {
+    const { question, faq, businessName } = req.body || {};
+    if (!question || !faq) {
+      return res.status(400).json({ error: "Missing 'question' or 'faq'." });
+    }
 
+    const biz = (businessName || "").trim();
+    const system = [
+      "You are an AI receptionist for a small business.",
+      "Answer *only* using the provided Knowledge Base.",
+      "If the answer is not contained there, say you don't have that information and suggest leaving a message or checking back.",
+      "Be concise (1–3 sentences), friendly, and accurate. Do not invent facts.",
+    ].join(" ");
+
+    const kbHeader = biz ? `Business: ${biz}\n` : "";
+    const user = `${kbHeader}Knowledge Base (Q/A format):\n---\n${faq}\n---\n\nQuestion: ${question}`;
+
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      max_tokens: 250,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ],
+    });
+
+    const answer = resp.choices?.[0]?.message?.content?.trim() || "Sorry—I don’t have that information in the knowledge base.";
+    return res.json({ answer });
+  } catch (e) {
+    console.error("/qa error:", e?.message || e);
+    return res.status(500).json({ error: "QA failed" });
+  }
+});
 
 //------------- test firestore connection ---------------
 app.get("/test-firestore", async (req, res) => {
