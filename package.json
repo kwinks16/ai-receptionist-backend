@@ -2,12 +2,14 @@
   "name": "ai-receptionist-backend",
   "version": "1.0.0",
   "type": "module",
+  "main": "server.js",
   "scripts": { "start": "node server.js" },
- "dependencies": {
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.10.0",
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
     "openai": "^4.57.0",
-    "@google-cloud/firestore": "^7.10.0",
     "ws": "^8.18.0"
   }
 }
