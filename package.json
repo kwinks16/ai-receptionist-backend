@@ -9,7 +9,6 @@
     "openai": "^4.57.0",
     "@google-cloud/firestore": "^7.10.0",
     "ws": "^8.18.0",
-    "mulaw": "^2.0.0",
     "pcm-resampler": "^1.2.0"
   }
 }
