@@ -430,28 +430,30 @@ wss.on("connection", async (twilioWs, req) => {
   // OpenAI -> Twilio
   let audioDeltaCount = 0;
   openaiWs.on("message", (raw) => {
-    try {
-      const evt = JSON.parse(raw.toString());
+     try {
+       const evt = JSON.parse(raw.toString());
 
-      if (evt.type === "response.output_audio.delta" && evt.delta?.audio) {
-        audioDeltaCount++;
-        if (audioDeltaCount === 1) {
-          console.log("[openai] first audio delta received");
-          if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
-        }
-        const base64Mu = pcm24kToTwilioMuLawBase64(Buffer.from(evt.delta.audio, "base64"));
-        if (streamSid) safeSendToTwilio(base64Mu);
-        else queueToTwilio.push({ base64Mu });
-      }
+       // ✅ Correct event name:
+       if (evt.type === "response.audio.delta" && evt.delta?.audio) {
+         audioDeltaCount++;
+         if (audioDeltaCount === 1) {
+           console.log("[openai] first audio delta received");
+           if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+         }
 
-      if (evt.type === "response.completed") {
-        console.log("[openai] response completed, deltas =", audioDeltaCount);
-        audioDeltaCount = 0;
-      }
-    } catch (e) {
-      console.error("OpenAI WS parse error:", e?.message || e);
-    }
-  });
+         const base64Mu = pcm24kToTwilioMuLawBase64(Buffer.from(evt.delta.audio, "base64"));
+         if (streamSid) safeSendToTwilio(base64Mu);
+         else queueToTwilio.push({ base64Mu });
+       }
+
+       if (evt.type === "response.completed") {
+         console.log("[openai] response completed, deltas =", audioDeltaCount);
+         audioDeltaCount = 0;
+       }
+     } catch (e) {
+       console.error("OpenAI WS parse error:", e?.message || e);
+     }
+   });
 
   // Ask OpenAI to speak periodically based on buffered audio
   const iv = setInterval(() => {
