@@ -313,6 +313,7 @@ wss.on("connection", async (twilioWs, req) => {
   });
 
   let streamSid = null;
+   const ECHO = /^true$/i.test(process.env.ECHO_MODE || "");
   let openaiOpen = false;
   let twilioOpen = true; // we're in connection callback
 
@@ -353,20 +354,16 @@ wss.on("connection", async (twilioWs, req) => {
   }
 
   // OpenAI session config
-  openaiWs.on("open", () => {
-    console.log("[openai] websocket open");
-    openaiOpen = true;
-    safeSendToOpenAI(JSON.stringify({
-      type: "session.update",
-      session: {
-        input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
-        output_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
-        instructions:
-          "You are a live AI receptionist. Be concise, friendly, and professional. " +
-          "Only use provided business knowledge if/when given. If unsure, ask a brief follow-up or take a message. " +
-          "Do not browse the web."
-      }
-    }));
+openaiWs.on("open", () => {
+  console.log("[openai] websocket open");
+
+  // Send immediate greeting when OpenAI connection is ready
+  safeSendToOpenAI(JSON.stringify({
+    type: "response.create",
+    response: {
+      instructions: "Hello! You’ve reached our AI receptionist. How can I help you today?"
+    }
+  }));
     // flush any queued messages
     while (queueToOpenAI.length) {
       const msg = queueToOpenAI.shift();
@@ -438,6 +435,20 @@ wss.on("connection", async (twilioWs, req) => {
     try { twilioWs.close(); } catch {}
     console.log("[ws] cleaned up");
   };
+
+   twilioWs.on("close", (code, reason) => {
+     console.log("[twilio] ws close:", code, reason?.toString());
+   });
+   twilioWs.on("error", (err) => {
+     console.log("[twilio] ws error:", err?.message || err);
+   });
+   openaiWs.on("close", (code, reason) => {
+     console.log("[openai] ws close:", code, reason?.toString());
+   });
+   openaiWs.on("error", (err) => {
+     console.log("[openai] ws error:", err?.message || err);
+   });
+   
   twilioWs.on("close", cleanup);
   twilioWs.on("error", cleanup);
   openaiWs.on("close", cleanup);
