@@ -309,8 +309,11 @@ wss.on("connection", async (twilioWs, req) => {
   // Connect to OpenAI Realtime
   const modelUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview";
   const openaiWs = new RealtimeWS(modelUrl, {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
-  });
+    headers: {
+       Authorization: `Bearer ${OPENAI_API_KEY}`,
+       "OpenAI-Beta": "realtime=v1"
+     }
+   });
 
   let streamSid = null;
    const ECHO = /^true$/i.test(process.env.ECHO_MODE || "");
