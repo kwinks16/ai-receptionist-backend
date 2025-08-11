@@ -9,7 +9,6 @@ import os from "os";
 import path from "path";
 import http from "http";
 import { WebSocketServer } from "ws";
-import { encode as muLawEncode, decode as muLawDecode } from "mulaw";
 import Resampler from "pcm-resampler";
 
 const {
@@ -36,6 +35,43 @@ const firestore = new Firestore();
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY, timeout: 60000 });
 
 // ---------- helpers ----------
+// ---- µ-law encode/decode (inline, no deps) ----
+// Based on ITU G.711 μ-law
+function muLawDecode(u8) {
+  // u8: Uint8Array of μ-law bytes
+  const len = u8.length;
+  const out = new Int16Array(len);
+  for (let i = 0; i < len; i++) {
+    let u = ~u8[i] & 0xff;
+    let sign = (u & 0x80) ? -1 : 1;
+    let exponent = (u >> 4) & 0x07;
+    let mantissa = u & 0x0f;
+    let sample = ((mantissa << 3) + 0x84) << exponent; // 0x84 = 132
+    out[i] = sign * sample;
+  }
+  return out;
+}
+
+function muLawEncode(pcm16) {
+  // pcm16: Int16Array linear PCM
+  const len = pcm16.length;
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    let s = pcm16[i];
+    let sign = 0;
+    let x = s;
+    if (x < 0) { sign = 0x80; x = -x; }
+    if (x > 32635) x = 32635;
+    x = x + 132; // bias
+    let exponent = 7;
+    for (let expMask = 0x4000; (x & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
+    let mantissa = (x >> (exponent + 3)) & 0x0f;
+    let u = ~(sign | (exponent << 4) | mantissa) & 0xff;
+    out[i] = u;
+  }
+  return out;
+}
+
 function summarize(text = "") {
   const t = text.trim();
   if (!t) return "";
@@ -259,18 +295,21 @@ wss.on("connection", async (twilioWs) => {
   const up = new Resampler({ inputSampleRate: 8000, outputSampleRate: 24000, channels: 1 });
   const down = new Resampler({ inputSampleRate: 24000, outputSampleRate: 8000, channels: 1 });
 
-  function twilioChunkToPcm24k(base64) {
-    const u8 = Buffer.from(base64, "base64");
-    const pcm8k = muLawDecode(u8); // Int16Array
-    const pcm24 = up.resample(Int16Array.from(pcm8k));
-    return Buffer.from(new Int16Array(pcm24).buffer);
-  }
-  function pcm24kToTwilioMuLawBase64(buf) {
-    const int16 = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
-    const pcm8k = down.resample(int16);
-    const mu = muLawEncode(Int16Array.from(pcm8k));
-    return Buffer.from(mu).toString("base64");
-  }
+// Twilio mu-law (8k) -> PCM16 24k
+function twilioChunkToPcm24k(base64) {
+  const u8 = Buffer.from(base64, "base64");
+  const pcm8k = muLawDecode(u8);                // Int16Array
+  const pcm24 = up.resample(Int16Array.from(pcm8k));
+  return Buffer.from(new Int16Array(pcm24).buffer);
+}
+
+// PCM16 24k -> Twilio mu-law (8k) base64
+function pcm24kToTwilioMuLawBase64(buf) {
+  const int16 = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
+  const pcm8k = down.resample(int16);           // Int16Array @8k
+  const mu = muLawEncode(Int16Array.from(pcm8k));
+  return Buffer.from(mu).toString("base64");
+}
 
   // Twilio → OpenAI (caller speech)
   twilioWs.on("message", (raw) => {
