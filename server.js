@@ -361,38 +361,38 @@ wss.on("connection", async (twilioWs, req) => {
   }
 
   // OpenAI session config + immediate greeting
-  openaiWs.on("open", () => {
-    console.log("[openai] websocket open");
-    openaiOpen = true;
+ openaiWs.on("open", () => {
+  console.log("[openai] websocket open");
+  openaiOpen = true;
 
-    safeSendToOpenAI(JSON.stringify({
-      type: "session.update",
-      session: {
-        modalities: ["audio"],
-        voice: "alloy",
-        input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
-        output_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
-        instructions:
-          "You are a live AI receptionist. Be concise, friendly, and professional. " +
-          "Only use provided business knowledge if/when given. If unsure, ask a brief follow-up or take a message. " +
-          "Do not browse the web."
-      }
-    }));
-
-    // Immediate greeting so caller hears something right away
-    safeSendToOpenAI(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-        instructions: "Hello! You’ve reached our AI receptionist. How can I help you today?"
-      }
-    }));
-
-    while (queueToOpenAI.length) {
-      const msg = queueToOpenAI.shift();
-      try { openaiWs.send(msg); } catch {}
+  // Configure session for audio I/O (explicit modalities + audio.voice)
+  safeSendToOpenAI(JSON.stringify({
+    type: "session.update",
+    session: {
+      modalities: ["audio"],
+      // You can include text also: ["text","audio"]
+      input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
+      output_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 }
     }
-  });
+  }));
+
+  // Send immediate audio greeting using modern schema
+  safeSendToOpenAI(JSON.stringify({
+    type: "response.create",
+    response: {
+      modalities: ["audio"],
+      instructions: "Hello! You’ve reached our AI receptionist. How can I help you today?",
+      audio: { voice: "alloy" }   // <-- voice goes inside 'audio'
+      // conversation: "default"   // <-- optional
+    }
+  }));
+
+  // Flush any queued messages
+  while (queueToOpenAI.length) {
+    const msg = queueToOpenAI.shift();
+    try { openaiWs.send(msg); } catch {}
+  }
+});
 
   // Twilio -> OpenAI
   twilioWs.on("message", (raw) => {
