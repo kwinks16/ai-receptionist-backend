@@ -308,7 +308,7 @@ app.post("/voicemail-complete", async (req, res) => {
 });
 
 // ---- Q&A from Business FAQ (grounded, no web) ----
-app.post("/qa", requireApiKey, async (req, res) => {
+app.post("/qa", async (req, res) => {
   try {
     const { question, faq, businessName } = req.body || {};
     if (!question || !faq) {
