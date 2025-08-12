@@ -442,8 +442,6 @@ function startSilenceKeepalive() {
   });
 
 // OpenAI -> Twilio
-let audioDeltaCount = 0;
-
 openaiWs.on("message", (raw) => {
   try {
     const evt = JSON.parse(raw.toString());
