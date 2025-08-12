@@ -345,6 +345,13 @@ wss.on("connection", async (twilioWs, req) => {
     return Buffer.from(mu).toString("base64");
   }
 
+   // --- μ-law 8kHz ~20ms silence frame (160 samples) ---
+   function ulawSilenceFrameBase64() {
+     // μ-law “silence” byte is 0xFF. 160 samples ≈ 20ms at 8kHz.
+     const bytes = Buffer.alloc(160, 0xFF);
+     return bytes.toString("base64");
+   }
+   
   // --- μ-law 8k 20ms silence frame (160 samples) keepalive ---
 function startSilenceKeepalive() {
   if (silenceTimer) return;
