@@ -337,14 +337,38 @@ wss.on("connection", async (twilioWs, req) => {
     return Buffer.from(new Int16Array(pcm24).buffer);
   }
 
-  // PCM16 24k -> Twilio mu-law 8k (base64)
-  function pcm24kToTwilioMuLawBase64(buf) {
-    const int16_24k = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
-    const int16_8k  = resampleLinear(int16_24k, 24000, 8000);
-    const mu        = muLawEncode(Int16Array.from(int16_8k));
-    return Buffer.from(mu).toString("base64");
-  }
+// PCM16 24k -> Twilio μ-law 8k (returns raw bytes, not base64)
+function pcm24kToTwilioMuLawBytes(buf) {
+  const int16_24k = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
+  const int16_8k  = resampleLinear(int16_24k, 24000, 8000);
+  const mu        = muLawEncode(Int16Array.from(int16_8k)); // Uint8Array
+  return Buffer.from(mu); // raw μ-law bytes
+}
 
+// Send raw μ-law bytes to Twilio in 160-byte (~20ms) frames
+function sendMuLawInChunksToTwilio(muBytes, streamSid, twilioWs, OPEN) {
+  if (!streamSid || twilioWs.readyState !== OPEN) return;
+
+  // muBytes: Buffer or Uint8Array
+  const buf = Buffer.isBuffer(muBytes) ? muBytes : Buffer.from(muBytes);
+  const frameSize = 160; // 20ms @ 8 kHz
+
+  for (let off = 0; off < buf.length; off += frameSize) {
+    const slice = buf.subarray(off, Math.min(off + frameSize, buf.length));
+    const payload = slice.toString("base64");
+    try {
+      twilioWs.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload }
+      }));
+    } catch (e) {
+      console.log("[to-twilio] send error:", e?.message || e);
+      break;
+    }
+  }
+}
+   
    // --- μ-law 8kHz ~20ms silence frame (160 samples) ---
    function ulawSilenceFrameBase64() {
      // μ-law “silence” byte is 0xFF. 160 samples ≈ 20ms at 8kHz.
@@ -408,11 +432,15 @@ function startSilenceKeepalive() {
     }
   }));
 
-  // Flush any queued messages
-  while (queueToOpenAI.length) {
-    const msg = queueToOpenAI.shift();
-    try { openaiWs.send(msg); } catch {}
+   // flush any queued-to-Twilio frames (if any)
+   if (streamSid && twilioWs.readyState === OPEN) {
+     while (queueToTwilio.length) {
+       const item = queueToTwilio.shift();
+       if (item.muBytes) {
+         sendMuLawInChunksToTwilio(item.muBytes, streamSid, twilioWs, OPEN);
+    }
   }
+}
 });
 
   // Twilio -> OpenAI
@@ -449,26 +477,35 @@ function startSilenceKeepalive() {
   });
 
 // OpenAI -> Twilio
+let audioDeltaCount = 0;
+
 openaiWs.on("message", (raw) => {
   try {
     const evt = JSON.parse(raw.toString());
     if (!evt?.type) return;
-    // Log the first few event types to verify schema we're getting
+
+    // (Optional) log first few event types for visibility
     if (audioDeltaCount < 1 || evt.type !== "response.audio.delta") {
       console.log("[openai] evt:", evt.type);
     }
 
-    // Current audio-delta event
     if (evt.type === "response.audio.delta" && evt.delta?.audio) {
       audioDeltaCount++;
       if (audioDeltaCount === 1) {
         console.log("[openai] first audio delta received");
         if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
       }
-      const base64Mu = pcm24kToTwilioMuLawBase64(Buffer.from(evt.delta.audio, "base64"));
-      console.log("[to-twilio] mu-law frame len=", base64Mu.length);  // add this
-      if (streamSid) safeSendToTwilio(base64Mu);
-      else queueToTwilio.push({ base64Mu });
+
+      // Convert model PCM(24k) → μ-law(8k) BYTES
+      const muBytes = pcm24kToTwilioMuLawBytes(Buffer.from(evt.delta.audio, "base64"));
+
+      // Chunk into 160-byte frames and send to Twilio
+      if (streamSid) {
+        sendMuLawInChunksToTwilio(muBytes, streamSid, twilioWs, OPEN);
+      } else {
+        // if streamSid not set yet (rare here), buffer one big frame to send after 'start'
+        queueToTwilio.push({ muBytes });
+      }
     }
 
     if (evt.type === "response.completed") {
