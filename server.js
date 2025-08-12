@@ -456,9 +456,9 @@ wss.on("connection", async (twilioWs, req) => {
         streamSid = msg.start?.streamSid || msg.streamSid || null;
         console.log("[twilio] start; streamSid =", streamSid);
         startSilenceKeepalive();
-        const tone = genToneMuLawBytes(1000, 440, 0.5);
-        enqueueMuLawFrames(tone);
-        console.log("[tone] enqueued", tone.length, "bytes (frames≈", Math.floor(tone.length/160), ")");
+       // const tone = genToneMuLawBytes(1000, 440, 0.5);
+       // enqueueMuLawFrames(tone);
+       // console.log("[tone] enqueued", tone.length, "bytes (frames≈", Math.floor(tone.length/160), ")");
         if (txQueue.length > 0) startTxLoop();
         return;
       }
