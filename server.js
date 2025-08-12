@@ -300,6 +300,9 @@ wss.on("connection", async (twilioWs, req) => {
   const RealtimeWS = (await import("ws")).default;
   const OPEN = 1;
 
+   let silenceTimer = null;   // <-- ensure this is defined in the connection scope
+   let audioDeltaCount = 0;   // (so cleanup can see it too)
+   
   // Connect to OpenAI Realtime (beta header required)
   const modelUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview";
   const openaiWs = new RealtimeWS(modelUrl, {
@@ -458,6 +461,7 @@ openaiWs.on("message", (raw) => {
         if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
       }
       const base64Mu = pcm24kToTwilioMuLawBase64(Buffer.from(evt.delta.audio, "base64"));
+      console.log("[to-twilio] mu-law frame len=", base64Mu.length);  // add this
       if (streamSid) safeSendToTwilio(base64Mu);
       else queueToTwilio.push({ base64Mu });
     }
@@ -492,6 +496,7 @@ openaiWs.on("message", (raw) => {
     try { twilioWs.close(); } catch {}
     console.log("[ws] cleaned up");
   };
+ 
   twilioWs.on("close", cleanup);
   twilioWs.on("error", cleanup);
   openaiWs.on("close", cleanup);
