@@ -301,7 +301,6 @@ wss.on("connection", async (twilioWs, req) => {
   const OPEN = 1;
 
    let silenceTimer = null;   // <-- ensure this is defined in the connection scope
-   let audioDeltaCount = 0;   // (so cleanup can see it too)
    
   // Connect to OpenAI Realtime (beta header required)
   const modelUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview";
