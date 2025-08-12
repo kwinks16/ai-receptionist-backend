@@ -421,14 +421,17 @@ wss.on("connection", async (twilioWs, req) => {
     openaiOpen = true;
 
     // Configure audio session (I/O formats)
-    safeSendToOpenAI(JSON.stringify({
-      type: "session.update",
-      session: {
-        modalities: ["audio"],
-        input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
-        output_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 }
-      }
-    }));
+   safeSendToOpenAI(JSON.stringify({
+     type: "session.update",
+     session: {
+       modalities: ["audio"],
+       // Keep input as PCM16@24k since you already upsample Twilio input to 24k
+       input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
+
+       // 👇 Force model to *output* Twilio-native G.711 μ-law @ 8k
+       output_audio_format: { type: "g711_ulaw", sample_rate_hz: 8000, channels: 1 }
+     }
+   }));
 
     // Immediate greeting (audio)
     safeSendToOpenAI(JSON.stringify({
@@ -487,6 +490,9 @@ wss.on("connection", async (twilioWs, req) => {
 openaiWs.on("message", (raw) => {
   try {
     const evt = JSON.parse(raw.toString());
+     if (evt.type === "error" || evt.type === "response.error") {
+       console.log("[openai] ERROR evt:", JSON.stringify(evt, null, 2));
+     }
     if (!evt?.type) return;
 
     // Visibility: log first time for each type (helps verify schema)
@@ -494,28 +500,21 @@ openaiWs.on("message", (raw) => {
       console.log("[openai] evt:", evt.type);
     }
 
-    // ✅ THIS is the current event that carries the audio PCM (base64)
-    if (evt.type === "response.audio.delta" && evt.delta?.audio) {
-      audioDeltaCount++;
-      if (audioDeltaCount === 1) {
-        console.log("[openai] first audio delta received");
-        // Stop silence keepalive on first real audio
-        if (typeof silenceTimer !== "undefined" && silenceTimer) {
-          clearInterval(silenceTimer);
-          silenceTimer = null;
-        }
-      }
+if (evt.type === "response.audio.delta" && evt.delta?.audio) {
+  audioDeltaCount++;
+  if (audioDeltaCount === 1) {
+    console.log("[openai] first audio delta received");
+    if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+  }
 
-      // 1) Convert from model PCM16@24k (base64) → μ-law@8k (bytes)
-      const pcm24 = Buffer.from(evt.delta.audio, "base64");
-      const muBytes = pcm24kToTwilioMuLawBytes(pcm24);
+  // Model is already outputting g711_ulaw@8k base64 — decode & enqueue
+  const ulawBytes = Buffer.from(evt.delta.audio, "base64");
 
-      // 2) Log how much audio is going out
-      console.log("[enqueue] model bytes=", muBytes.length, "frames≈", Math.floor(muBytes.length / 160));
+  // Optional debug: how many frames will we send?
+  console.log("[enqueue] model bytes=", ulawBytes.length, "frames≈", Math.floor(ulawBytes.length / 160));
 
-      // 3) Enqueue as paced 160-byte frames (sender will drain @ ~25ms)
-      enqueueMuLawFrames(muBytes);
-    }
+  enqueueMuLawFrames(ulawBytes); // paced sender will drain @ ~25ms
+}
 
     if (evt.type === "response.completed") {
       console.log("[openai] response completed, deltas =", audioDeltaCount);
