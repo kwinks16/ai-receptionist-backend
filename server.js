@@ -343,22 +343,33 @@ wss.on("connection", async (twilioWs, req) => {
   }
 
   // --- μ-law 8k 20ms silence frame (160 samples) keepalive ---
-  function ulawSilenceFrameBase64() {
-    const bytes = Buffer.alloc(160, 0xFF); // μ-law silence
-    return bytes.toString("base64");
-  }
-  let silenceTimer = null;
-  function startSilenceKeepalive() {
-    if (silenceTimer) return;
-    let ticks = 0;
-    silenceTimer = setInterval(() => {
-      ticks++;
-      if (!streamSid || twilioWs.readyState !== OPEN) return;
-      const payload = ulawSilenceFrameBase64();
-      try { twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } })); } catch {}
-      if (ticks > 24) { clearInterval(silenceTimer); silenceTimer = null; } // ~8.4s
-    }, 350);
-  }
+function startSilenceKeepalive() {
+  if (silenceTimer) return;
+  let ticks = 0;
+  console.log("[keepalive] starting silence loop");
+  silenceTimer = setInterval(() => {
+    ticks++;
+    if (!streamSid || twilioWs.readyState !== OPEN) {
+      // if Twilio not ready, just wait
+      return;
+    }
+    const payload = ulawSilenceFrameBase64();
+    try {
+      twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+      if (ticks <= 5 || ticks % 5 === 0) {
+        // log the first few and then every 5th to avoid spam
+        console.log(`[keepalive] sent silence tick=${ticks}`);
+      }
+    } catch (e) {
+      console.log("[keepalive] send error:", e?.message || e);
+    }
+    if (ticks > 30) { // ~10.5s
+      clearInterval(silenceTimer);
+      silenceTimer = null;
+      console.log("[keepalive] stopped (timeout)");
+    }
+  }, 350);
+}
 
   // OpenAI session config + immediate greeting
  openaiWs.on("open", () => {
@@ -399,19 +410,19 @@ wss.on("connection", async (twilioWs, req) => {
     try {
       const msg = JSON.parse(raw.toString());
 
-      if (msg.event === "start") {
-        streamSid = msg.start?.streamSid || msg.streamSid || null;
-        console.log("[twilio] start; streamSid =", streamSid);
-        startSilenceKeepalive(); // begin keepalive until first model audio
-
-        if (streamSid && twilioWs.readyState === OPEN) {
-          while (queueToTwilio.length) {
-            const { base64Mu } = queueToTwilio.shift();
-            try { twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Mu } })); } catch {}
-          }
-        }
-        return;
-      }
+   if (msg.event === "start") {
+     streamSid = msg.start?.streamSid || msg.streamSid || null;
+     console.log("[twilio] start; streamSid =", streamSid);
+     startSilenceKeepalive(); // <-- keepalive begins here
+     // flush any queued-to-Twilio frames
+     if (streamSid && twilioWs.readyState === OPEN) {
+       while (queueToTwilio.length) {
+         const { base64Mu } = queueToTwilio.shift();
+         try { twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64Mu } })); } catch {}
+       }
+     }
+     return;
+   }
 
       if (msg.event === "media" && msg.media?.payload) {
         const pcm24 = twilioChunkToPcm24k(msg.media.payload);
@@ -427,41 +438,46 @@ wss.on("connection", async (twilioWs, req) => {
     }
   });
 
-  // OpenAI -> Twilio
-  let audioDeltaCount = 0;
-  openaiWs.on("message", (raw) => {
-     try {
-       const evt = JSON.parse(raw.toString());
+// OpenAI -> Twilio
+let audioDeltaCount = 0;
 
-       // ✅ Correct event name:
-       if (evt.type === "response.audio.delta" && evt.delta?.audio) {
-         audioDeltaCount++;
-         if (audioDeltaCount === 1) {
-           console.log("[openai] first audio delta received");
-           if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
-         }
+openaiWs.on("message", (raw) => {
+  try {
+    const evt = JSON.parse(raw.toString());
+    if (!evt?.type) return;
+    // Log the first few event types to verify schema we're getting
+    if (audioDeltaCount < 1 || evt.type !== "response.audio.delta") {
+      console.log("[openai] evt:", evt.type);
+    }
 
-         const base64Mu = pcm24kToTwilioMuLawBase64(Buffer.from(evt.delta.audio, "base64"));
-         if (streamSid) safeSendToTwilio(base64Mu);
-         else queueToTwilio.push({ base64Mu });
-       }
+    // Current audio-delta event
+    if (evt.type === "response.audio.delta" && evt.delta?.audio) {
+      audioDeltaCount++;
+      if (audioDeltaCount === 1) {
+        console.log("[openai] first audio delta received");
+        if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+      }
+      const base64Mu = pcm24kToTwilioMuLawBase64(Buffer.from(evt.delta.audio, "base64"));
+      if (streamSid) safeSendToTwilio(base64Mu);
+      else queueToTwilio.push({ base64Mu });
+    }
 
-       if (evt.type === "response.completed") {
-         console.log("[openai] response completed, deltas =", audioDeltaCount);
-         audioDeltaCount = 0;
-       }
-     } catch (e) {
-       console.error("OpenAI WS parse error:", e?.message || e);
-     }
-   });
+    if (evt.type === "response.completed") {
+      console.log("[openai] response completed, deltas =", audioDeltaCount);
+      audioDeltaCount = 0;
+    }
+  } catch (e) {
+    console.error("OpenAI WS parse error:", e?.message || e);
+  }
+});
 
   // Ask OpenAI to speak periodically based on buffered audio
-  const iv = setInterval(() => {
-    if (openaiOpen && openaiWs.readyState === OPEN) {
-      safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      safeSendToOpenAI(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
-    }
-  }, 800);
+   const iv = setInterval(() => {
+     if (openaiOpen && openaiWs.readyState === OPEN) {
+       safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.commit" }));
+       safeSendToOpenAI(JSON.stringify({ type: "response.create", response: { modalities: ["audio"], audio: { voice: "alloy" } } }));
+     }
+   }, 800);
 
   // Close/error logs & cleanup
   twilioWs.on("close", (code, reason) => { console.log("[twilio] ws close:", code, reason?.toString()); });
