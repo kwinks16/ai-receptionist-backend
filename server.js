@@ -116,6 +116,23 @@ function muLawEncode(pcm16) {
   return out;
 }
 
+// Generate μ-law 8 kHz mono tone frames (~durationMs) at freqHz
+function genToneMuLawBytes(durationMs = 1000, freqHz = 440, gain = 0.6) {
+  const sampleRate = 8000;
+  const totalSamples = Math.floor(sampleRate * (durationMs / 1000));
+  const twoPiOverFs = 2 * Math.PI * freqHz / sampleRate;
+
+  // make PCM16
+  const pcm = new Int16Array(totalSamples);
+  for (let n = 0; n < totalSamples; n++) {
+    const v = Math.sin(twoPiOverFs * n) * gain;
+    pcm[n] = Math.max(-1, Math.min(1, v)) * 32767;
+  }
+  // μ-law encode
+  const mu = muLawEncode(pcm); // Uint8Array
+  return Buffer.from(mu);      // raw μ-law bytes
+}
+
 /* ---- Simple linear resampler: Int16 mono PCM ---- */
 function resampleLinear(int16In, inRate, outRate) {
   if (inRate === outRate) return Int16Array.from(int16In);
@@ -339,6 +356,7 @@ wss.on("connection", async (twilioWs, req) => {
       const payload = frame.toString("base64");
       try {
         twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+        if ((Math.random()*20|0) === 0) console.log("[to-twilio] frame sent; queue=", txQueue.length);
       } catch (e) {
         console.log("[to-twilio] send error:", e?.message || e);
         clearInterval(txTimer); txTimer = null;
@@ -438,6 +456,9 @@ wss.on("connection", async (twilioWs, req) => {
         streamSid = msg.start?.streamSid || msg.streamSid || null;
         console.log("[twilio] start; streamSid =", streamSid);
         startSilenceKeepalive();
+        const tone = genToneMuLawBytes(1000, 440, 0.5);
+        enqueueMuLawFrames(tone);
+        console.log("[tone] enqueued", tone.length, "bytes (frames≈", Math.floor(tone.length/160), ")");
         if (txQueue.length > 0) startTxLoop();
         return;
       }
@@ -479,6 +500,7 @@ wss.on("connection", async (twilioWs, req) => {
         }
         const muBytes = pcm24kToTwilioMuLawBytes(Buffer.from(evt.delta.audio, "base64"));
         enqueueMuLawFrames(muBytes); // paced send
+        console.log("[enqueue] model bytes=", muBytes.length, "frames≈", Math.floor(muBytes.length/160));
       }
 
       if (evt.type === "response.completed") {
