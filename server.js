@@ -421,27 +421,29 @@ wss.on("connection", async (twilioWs, req) => {
     openaiOpen = true;
 
     // Configure audio session (I/O formats)
-   safeSendToOpenAI(JSON.stringify({
-     type: "session.update",
-     session: {
-       modalities: ["audio"],
-       // Keep input as PCM16@24k since you already upsample Twilio input to 24k
-       input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
+safeSendToOpenAI(JSON.stringify({
+  type: "session.update",
+  session: {
+    // Must include both:
+    modalities: ["audio", "text"],
 
-       // 👇 Force model to *output* Twilio-native G.711 μ-law @ 8k
-       output_audio_format: { type: "g711_ulaw", sample_rate_hz: 8000, channels: 1 }
-     }
-   }));
+    // Set voice once at the session level
+    voice: "alloy",
+
+    // Keep your I/O formats
+    input_audio_format:  { type: "pcm16",   sample_rate_hz: 24000, channels: 1 },
+    output_audio_format: { type: "g711_ulaw", sample_rate_hz: 8000,  channels: 1 }
+  }
+}));
 
     // Immediate greeting (audio)
-    safeSendToOpenAI(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-        instructions: "Hello! You’ve reached our AI receptionist. How can I help you today?",
-        audio: { voice: "alloy" }
-      }
-    }));
+safeSendToOpenAI(JSON.stringify({
+  type: "response.create",
+  response: {
+    modalities: ["audio"],
+    instructions: "Hello! You’ve reached our AI receptionist. How can I help you today?"
+  }
+}));
 
     // Flush any queued messages
     while (queueToOpenAI.length) {
@@ -525,16 +527,6 @@ if (evt.type === "response.audio.delta" && evt.delta?.audio) {
   }
 });
 
-  // --- periodic commit & response request for snappier turn-taking ---
-  const iv = setInterval(() => {
-    if (openaiOpen && openaiWs.readyState === OPEN) {
-      safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      safeSendToOpenAI(JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["audio"], audio: { voice: "alloy" } }
-      }));
-    }
-  }, 800);
 
   // --- close/error logs & cleanup ---
   twilioWs.on("close", (code, reason) => { console.log("[twilio] ws close:", code, reason?.toString()); });
@@ -545,7 +537,6 @@ if (evt.type === "response.audio.delta" && evt.delta?.audio) {
   const cleanup = () => {
     if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
     if (txTimer) { clearInterval(txTimer); txTimer = null; }
-    clearInterval(iv);
     try { openaiWs.close(); } catch {}
     try { twilioWs.close(); } catch {}
     txQueue = [];
