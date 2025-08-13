@@ -508,40 +508,42 @@ safeSendToOpenAI(JSON.stringify({
   // --- OpenAI -> Twilio: stream audio deltas, pace out as 160B frames ---
   // --- OpenAI -> Twilio (definitive handler) ---
 
+// --- OpenAI → Twilio: convert PCM16@24k to μ-law@8k and enqueue ---
 openaiWs.on("message", (raw) => {
-  try {
-    const evt = JSON.parse(raw.toString());
-     if (evt.type === "error" || evt.type === "response.error") {
-       console.log("[openai] ERROR evt:", JSON.stringify(evt, null, 2));
-     }
-    if (!evt?.type) return;
+  let evt;
+  try { evt = JSON.parse(raw.toString()); } catch (e) {
+    console.error("[openai] parse error:", e?.message || e);
+    return;
+  }
+  if (!evt?.type) return;
 
-    // Visibility: log first time for each type (helps verify schema)
-    if (audioDeltaCount < 1 || evt.type !== "response.audio.delta") {
-      console.log("[openai] evt:", evt.type);
-    }
+  // Print ALL event types for now
+  console.log("[openai] evt:", evt.type);
 
-if (evt.type === "response.audio.delta" && evt.delta?.audio) {
-  audioDeltaCount++;
-  if (audioDeltaCount === 1) {
-    console.log("[openai] first audio delta received");
-    if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+  // Print any error payloads fully
+  if (evt.type === "error" || evt.type === "response.error") {
+    console.log("[openai] ERROR evt:", JSON.stringify(evt, null, 2));
+    return;
   }
 
-  // Model audio is PCM16@24k (base64) → convert to μ-law@8k for Twilio
-  const pcm24 = Buffer.from(evt.delta.audio, "base64");
-  const muBytes = pcm24kToTwilioMuLawBytes(pcm24);
-
-  console.log("[enqueue] model bytes=", muBytes.length, "frames≈", Math.floor(muBytes.length / 160));
-  enqueueMuLawFrames(muBytes);
-}
-
-    if (evt.type === "response.completed") {
-      console.log("[openai] response completed, deltas =", audioDeltaCount);
-      audioDeltaCount = 0;
+  // The model is sending audio in PCM16@24k (base64). Convert → μ-law@8k → enqueue.
+  if (evt.type === "response.audio.delta" && evt.delta?.audio) {
+    if (audioDeltaCount++ === 0 && silenceTimer) {
+      clearInterval(silenceTimer); silenceTimer = null;
+      console.log("[openai] first audio delta; stopped keepalive");
     }
-  } catch (e) {
-    console.error("OpenAI WS parse error:", e?.message || e);
+
+    const pcm24 = Buffer.from(evt.delta.audio, "base64");     // raw PCM16 at 24k
+    const muBytes = pcm24kToTwilioMuLawBytes(pcm24);          // raw μ-law at 8k (Buffer)
+
+    console.log("[enqueue] model bytes=", muBytes.length, "frames≈", Math.floor(muBytes.length / 160));
+    enqueueMuLawFrames(muBytes);                               // paced sender drains at ~25ms
+    return;
+  }
+
+  if (evt.type === "response.done") {
+    console.log("[openai] response done; deltas =", audioDeltaCount);
+    audioDeltaCount = 0;
   }
 });
 
