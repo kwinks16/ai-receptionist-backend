@@ -534,44 +534,61 @@ safeSendToOpenAI(JSON.stringify({
   // --- OpenAI -> Twilio (definitive handler) ---
 
 // --- OpenAI → Twilio: decode audio delta and enqueue to Twilio ---
+// --- OpenAI → Twilio: decode audio delta and enqueue to Twilio ---
 openaiWs.on("message", (raw) => {
   let evt;
-  try { evt = JSON.parse(raw.toString()); } catch (e) {
+  try {
+    evt = JSON.parse(raw.toString());
+  } catch (e) {
     console.error("[openai] parse error:", e?.message || e);
     return;
   }
+
   if (!evt?.type) return;
 
-  // Log all event types for now
-  console.log("[openai] evt:", evt.type);
+  // Log event types (kept modest to avoid jitter)
+  if (evt.type !== "response.audio.delta") {
+    console.log("[openai] evt:", evt.type);
+  }
 
-  // Print full error objects
+  // Print full errors (these are infrequent)
   if (evt.type === "error" || evt.type === "response.error") {
     console.log("[openai] ERROR evt:", JSON.stringify(evt, null, 2));
     return;
   }
 
-if (evt.type === "response.audio.delta") {
-  // ... (after you decode base64 and before enqueue)
-  if (audioDeltaCount === 1) {
-    console.log("[openai] first audio delta; queueing audio to Twilio");
-  }
-  // avoid logging every frame here—let the sender’s throttled log show progress
-}
+  if (evt.type === "response.audio.delta") {
+    // Normalize the base64 field across schema variants
+    let b64 = null;
+    if (typeof evt.delta === "string") {
+      b64 = evt.delta;
+    } else if (evt.delta && typeof evt.delta.audio === "string") {
+      b64 = evt.delta.audio;
+    } else if (evt.delta && typeof evt.delta.data === "string") {
+      b64 = evt.delta.data;
+    } else if (typeof evt.audio === "string") {
+      b64 = evt.audio;
+    } else if (typeof evt.bytes === "string") {
+      b64 = evt.bytes;
+    }
 
     if (!b64) {
-      console.log("[openai] delta had no recognized audio field; keys in delta =",
-        Object.keys(evt.delta || {}));
+      console.log(
+        "[openai] delta had no recognized audio field; keys in delta =",
+        Object.keys(evt.delta || {})
+      );
       return;
     }
 
-    // First time we get real audio: stop the keepalive
-    if (audioDeltaCount++ === 0 && silenceTimer) {
-      clearInterval(silenceTimer); silenceTimer = null;
-      // console.log("[openai] first audio delta; keepalive stopped");
+    // Stop keepalive on the first real audio frame
+    if (audioDeltaCount === 0 && silenceTimer) {
+      clearInterval(silenceTimer);
+      silenceTimer = null;
+      console.log("[keepalive] stopped on first model audio");
     }
+    audioDeltaCount += 1;
 
-    // Model audio is PCM16@24k in base64 (default session). Convert → μ-law@8k → enqueue.
+    // Convert model PCM16@24k → μ-law@8k, then enqueue
     let pcm24;
     try {
       pcm24 = Buffer.from(b64, "base64");
@@ -584,10 +601,13 @@ if (evt.type === "response.audio.delta") {
       return;
     }
 
-    const muBytes = pcm24kToTwilioMuLawBytes(pcm24);   // Buffer of μ-law@8k bytes
-    console.log("[enqueue] model bytes =", muBytes.length,
-                "frames≈", Math.floor(muBytes.length / 160));
-    enqueueMuLawFrames(muBytes);                        // paced sender drains @ ~25ms
+    const muBytes = pcm24kToTwilioMuLawBytes(pcm24); // Buffer of μ-law@8k bytes
+    // Throttle logs: show size only for first chunk of each response
+    if (audioDeltaCount === 1) {
+      const frames = Math.floor(muBytes.length / 160);
+      console.log("[enqueue] first model bytes =", muBytes.length, "frames≈", frames);
+    }
+    enqueueMuLawFrames(muBytes); // paced sender drains @ ~20ms
     return;
   }
 
@@ -596,7 +616,6 @@ if (evt.type === "response.audio.delta") {
     audioDeltaCount = 0;
   }
 });
-
 
   // --- close/error logs & cleanup ---
   twilioWs.on("close", (code, reason) => { console.log("[twilio] ws close:", code, reason?.toString()); });
