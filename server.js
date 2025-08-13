@@ -345,35 +345,60 @@ wss.on("connection", async (twilioWs, req) => {
   let commitTimer = null;
 
   // paced transmitter state
-  let txQueue = [];            // array<Buffer(160)>
-  let txTimer = null;          // setInterval handle
+  const FRAME_MS = 20;               // Twilio expects 20ms per frame
+  const FRAME_BYTES = 160;           // 160 μ-law bytes = 20ms @ 8kHz
+   
+  let txQueue = [];                  // Array<Buffer(160)>
+  let txTimer = null;                // setTimeout handle
+  let nextDeadline = 0;              // drift-corrected scheduler
+  let carry = Buffer.alloc(0);       // leftover bytes between enqueues
+  const PREBUFFER_FRAMES = 8;        // ~160ms buffer to hide jitter
 
   // --- paced transmit: send one 20ms μ-law frame every ~25ms ---
   function startTxLoop() {
-    if (txTimer) return;
-    txTimer = setInterval(() => {
-      if (!streamSid || twilioWs.readyState !== OPEN) return;
-      if (txQueue.length === 0) { clearInterval(txTimer); txTimer = null; return; }
-      const frame = txQueue.shift(); // Buffer(160)
-      const payload = frame.toString("base64");
-      try {
-        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
-        if ((Math.random()*20|0) === 0) console.log("[to-twilio] frame sent; queue=", txQueue.length);
-      } catch (e) {
-        console.log("[to-twilio] send error:", e?.message || e);
-        clearInterval(txTimer); txTimer = null;
-      }
-    }, 25); // ~real-time pacing
-  }
+  if (txTimer) return;
+  nextDeadline = Date.now();
+  const tick = () => {
+    if (!streamSid || twilioWs.readyState !== OPEN) { txTimer = null; return; }
 
-  function enqueueMuLawFrames(muBytes) {
-    const buf = Buffer.isBuffer(muBytes) ? muBytes : Buffer.from(muBytes);
-    const frameSize = 160; // 20ms@8k
-    for (let off = 0; off + frameSize <= buf.length; off += frameSize) {
-      txQueue.push(buf.subarray(off, off + frameSize));
+    // send exactly one 20ms frame if available
+    if (txQueue.length > 0) {
+      const frame = txQueue.shift();
+      const payload = frame.toString("base64");
+   
+   let sent = 0;  // add near txLoop scope
+
+   try {
+     twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+     if ((++sent % 20) === 0) {
+       // log every ~400ms (20 frames * 20ms)
+       console.log("[to-twilio] sent frames:", sent, "queue:", txQueue.length);
+     }
+   } catch (e) {
+     console.log("[to-twilio] send error:", e?.message || e);
+     txTimer = null;
+     return;
+   }
     }
-    if (txQueue.length > 0) startTxLoop();
+
+    // drift-corrected scheduling
+    nextDeadline += FRAME_MS;
+    const delay = Math.max(0, nextDeadline - Date.now());
+    txTimer = setTimeout(tick, delay);
+  };
+  txTimer = setTimeout(tick, 0);
+}
+
+function enqueueMuLawFrames(muBytes) {
+  // accumulate then chop into 160B frames
+  carry = Buffer.concat([carry, Buffer.isBuffer(muBytes) ? muBytes : Buffer.from(muBytes)]);
+  while (carry.length >= FRAME_BYTES) {
+    txQueue.push(carry.subarray(0, FRAME_BYTES));
+    carry = carry.subarray(FRAME_BYTES);
   }
+  // only start once we have a small buffer to smooth bursts
+  if (!txTimer && txQueue.length >= PREBUFFER_FRAMES) startTxLoop();
+}
 
   // --- local silence keepalive (no external deps) ---
   function startSilenceKeepalive() {
@@ -387,7 +412,7 @@ wss.on("connection", async (twilioWs, req) => {
       const payload = Buffer.alloc(160, 0xFF).toString("base64");
       try {
         twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
-        if (ticks <= 5 || ticks % 5 === 0) console.log(`[keepalive] sent silence tick=${ticks}`);
+        // if (ticks <= 5 || ticks % 5 === 0) console.log(`[keepalive] sent silence tick=${ticks}`);
       } catch (e) {
         console.log("[keepalive] send error:", e?.message || e);
       }
@@ -440,13 +465,13 @@ safeSendToOpenAI(JSON.stringify({
 }));
 
     // Immediate greeting (audio)
-safeSendToOpenAI(JSON.stringify({
-  type: "response.create",
-  response: {
-    modalities: ["audio", "text"],
-    instructions: "Hello! You’ve reached our AI receptionist. How can I help you today?"
-  }
-}));
+   safeSendToOpenAI(JSON.stringify({
+     type: "response.create",
+     response: {
+       modalities: ["audio", "text"],
+       instructions: "Hello! You’ve reached our AI receptionist. Please speak clearly and I’ll help. (Speak at a calm, even pace.)"
+     }
+   }));
 
     // Flush any queued messages
     while (queueToOpenAI.length) {
@@ -460,13 +485,13 @@ safeSendToOpenAI(JSON.stringify({
   try {
     const msg = JSON.parse(raw.toString());
 
-    if (msg.event === "start") {
-      streamSid = msg.start?.streamSid || msg.streamSid || null;
-      console.log("[twilio] start; streamSid =", streamSid);
-      startSilenceKeepalive();
-      if (txQueue.length > 0) startTxLoop();
-      return;
-    }
+   if (msg.event === "start") {
+     streamSid = msg.start?.streamSid || msg.streamSid || null;
+     console.log("[twilio] start; streamSid =", streamSid);
+     if (!silenceTimer) startSilenceKeepalive();  // guard against double-starts
+     if (txQueue.length > 0) startTxLoop();
+     return;
+   }
 
     if (msg.event === "media" && msg.media?.payload) {
       // Twilio μ-law (8k) -> PCM16 (24k), then append to OpenAI buffer
@@ -508,7 +533,6 @@ safeSendToOpenAI(JSON.stringify({
   // --- OpenAI -> Twilio: stream audio deltas, pace out as 160B frames ---
   // --- OpenAI -> Twilio (definitive handler) ---
 
-// --- OpenAI → Twilio: convert PCM16@24k to μ-law@8k and enqueue ---
 // --- OpenAI → Twilio: decode audio delta and enqueue to Twilio ---
 openaiWs.on("message", (raw) => {
   let evt;
@@ -527,14 +551,13 @@ openaiWs.on("message", (raw) => {
     return;
   }
 
-  if (evt.type === "response.audio.delta") {
-    // Normalize the base64 field across schema variants
-    let b64 = null;
-    if (typeof evt.delta === "string")                b64 = evt.delta;
-    else if (evt.delta && typeof evt.delta.audio === "string") b64 = evt.delta.audio;
-    else if (evt.delta && typeof evt.delta.data  === "string") b64 = evt.delta.data;
-    else if (typeof evt.audio === "string")         b64 = evt.audio;
-    else if (typeof evt.bytes === "string")         b64 = evt.bytes;
+if (evt.type === "response.audio.delta") {
+  // ... (after you decode base64 and before enqueue)
+  if (audioDeltaCount === 1) {
+    console.log("[openai] first audio delta; queueing audio to Twilio");
+  }
+  // avoid logging every frame here—let the sender’s throttled log show progress
+}
 
     if (!b64) {
       console.log("[openai] delta had no recognized audio field; keys in delta =",
@@ -545,7 +568,7 @@ openaiWs.on("message", (raw) => {
     // First time we get real audio: stop the keepalive
     if (audioDeltaCount++ === 0 && silenceTimer) {
       clearInterval(silenceTimer); silenceTimer = null;
-      console.log("[openai] first audio delta; keepalive stopped");
+      // console.log("[openai] first audio delta; keepalive stopped");
     }
 
     // Model audio is PCM16@24k in base64 (default session). Convert → μ-law@8k → enqueue.
