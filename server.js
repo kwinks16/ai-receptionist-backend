@@ -314,7 +314,11 @@ app.post("/voice-realtime", (req, res) => {
 
   const twiml = `
     <Response>
-      <Say voice="Polly.Joanna">Connecting you. One moment please.</Say>
+      <Say voice="Polly.Joanna">
+        Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail.
+        You can say "voicemail" or press 1 at any time to leave a message.
+        Connecting you now.
+      </Say>
       <Connect>
         <Stream url="${wsUrl}">
           <Parameter name="callSid" value="${(req.body?.CallSid || "").toString()}"/>
@@ -373,6 +377,32 @@ wss.on("connection", async (twilioWs, req) => {
   let streamSid = null;
   let callSid = null;
   let openaiOpen = false;
+   let transferring = false;
+
+// tiny helper so we only transfer once
+async function triggerVoicemailTransfer() {
+  if (transferring) return;
+  transferring = true;
+  const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
+  try {
+    // short confirmation via model (optional)
+    try {
+      openaiWs.send(JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio","text"],
+          instructions: "Okay—sending you to voicemail now. Please leave your message after the beep."
+        }
+      }));
+    } catch {}
+    await transferToVoicemail(callSid, base);
+  } catch (e) {
+    console.error("[voicemail] transfer failed:", e?.message || e);
+  } finally {
+    try { openaiWs.close(); } catch {}
+    try { twilioWs.close(); } catch {}
+  }
+}
 
   // pacing back to Twilio
   let txQueue = [];     // Buffer(160) frames
@@ -455,14 +485,17 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }));
 
-    // Assistant greeting from model
-    safeSendToOpenAI(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio","text"],
-        instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?"
-      }
-    }));
+   // Assistant greeting + strict policy on voicemail
+   safeSendToOpenAI(JSON.stringify({
+     type: "response.create",
+     response: {
+       modalities: ["audio","text"],
+       instructions:
+         "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. " +
+         "Important: If the caller asks to leave a voicemail (or says 'voicemail'), DO NOT explain steps. " +
+         "Simply acknowledge and I (the system) will transfer them. Keep replies brief and wait for the caller."
+     }
+   }));
 
     // flush queued messages
     while (queueToOpenAI.length) { try { openaiWs.send(queueToOpenAI.shift()); } catch {} }
@@ -473,6 +506,11 @@ wss.on("connection", async (twilioWs, req) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
+    if (msg.event === "dtmf" && msg.dtmf?.digit === "1") {
+    console.log("[twilio] DTMF 1 pressed → transfer to voicemail");
+    return triggerVoicemailTransfer();
+  }
+     
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || msg.streamSid || null;
       callSid   = msg.start?.callSid || msg.start?.customParameters?.callSid || callSid || null;
@@ -513,67 +551,53 @@ wss.on("connection", async (twilioWs, req) => {
     );
   };
 
-  openaiWs.on("message", async (raw) => {
-    let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
-    if (!evt?.type) return;
+// ---- detect speech intent from user transcripts ASAP ----
+function textWantsVoicemail(t="") {
+  const x = t.toLowerCase();
+  return (
+    /\bvoicemail\b/.test(x) ||
+    /\bleave (a )?message\b/.test(x) ||
+    /\btake (a )?message\b/.test(x) ||
+    /\bcan i (just )?leave\b/.test(x)
+  );
+}
 
-    // Mark first model turn complete
-    if (evt.type === "response.done" || evt.type === "response.output_item.done") {
-      if (!firstModelTurnDone) firstModelTurnDone = true;
+openaiWs.on("message", async (raw) => {
+  let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
+  if (!evt?.type) return;
+
+  // 1) USER speech/text arrives as conversation items → detect intent immediately
+  if (evt.type === "conversation.item.created" && evt.item?.role === "user" && !transferring) {
+    let said = "";
+    for (const part of (evt.item.content || [])) {
+      if (typeof part?.transcript === "string") said += " " + part.transcript;
+      if (typeof part?.text === "string")       said += " " + part.text;
+      if (part?.type === "input_text" && typeof part?.text === "string") said += " " + part.text;
     }
-
-    // Detect voicemail intent only after the greeting has finished
-    if (evt.type === "conversation.item.created" && evt.item?.role === "user" && firstModelTurnDone) {
-      let userText = "";
-      for (const part of (evt.item.content || [])) {
-        if (typeof part?.transcript === "string") userText += " " + part.transcript;
-        if (typeof part?.text === "string")       userText += " " + part.text;
-        if (part?.type === "input_text" && typeof part?.text === "string") userText += " " + part.text;
-      }
-      if (wantsVoicemail(userText)) {
-        const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
-        // brief confirmation
-        try {
-          openaiWs.send(JSON.stringify({
-            type: "response.create",
-            response: {
-              modalities: ["audio","text"],
-              instructions: "Sure—I'll switch you to voicemail. Please leave your message after the beep."
-            }
-          }));
-        } catch {}
-        // hand off the live call
-        try {
-          await transferToVoicemail(callSid, base);
-        } catch (e) {
-          console.error("[voicemail] transfer failed:", e?.message || e);
-        }
-        // end sockets (Twilio will leave the stream and hit /voicemail-twiml)
-        try { openaiWs.close(); } catch {}
-        try { twilioWs.close(); } catch {}
-        return;
-      }
+    if (textWantsVoicemail(said)) {
+      console.log("[intent] user asked for voicemail → transferring");
+      return triggerVoicemailTransfer();
     }
+  }
 
-    // Stream model audio to Twilio (24k PCM → 8k μ-law, paced)
-    if (evt.type === "response.audio.delta") {
-      // Normalize base64 field across schema variants
-      let b64 = null;
-      if (typeof evt.delta === "string") b64 = evt.delta;
-      else if (evt.delta && typeof evt.delta.audio === "string") b64 = evt.delta.audio;
-      else if (evt.delta && typeof evt.delta.data  === "string") b64 = evt.delta.data;
-      else if (typeof evt.audio === "string") b64 = evt.audio;
-      if (!b64) return;
+  // 2) stream model audio to Twilio (unchanged)
+  if (evt.type === "response.audio.delta") {
+    let b64 = null;
+    if (typeof evt.delta === "string") b64 = evt.delta;
+    else if (evt.delta && typeof evt.delta.audio === "string") b64 = evt.delta.audio;
+    else if (evt.delta && typeof evt.delta.data  === "string") b64 = evt.delta.data;
+    else if (typeof evt.audio === "string") b64 = evt.audio;
+    if (!b64) return;
 
-      // first audio? stop keepalive
-      if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+    if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+    const pcm24 = Buffer.from(b64, "base64");
+    const mu    = pcm24kToTwilioMuLawBytes(pcm24);
+    enqueueMuLawFrames(mu);
+    return;
+  }
 
-      const pcm24 = Buffer.from(b64, "base64");
-      const mu    = pcm24kToTwilioMuLawBytes(pcm24);
-      enqueueMuLawFrames(mu);
-      return;
-    }
-  });
+  // (leave any other event handlers you have as-is)
+});
 
   // cleanup
   const cleanup = () => {
