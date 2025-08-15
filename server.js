@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import fetch from "node-fetch";
 import { OpenAI } from "openai";
@@ -312,6 +311,24 @@ app.get("/api/voicemails", async (_req, res) => {
 ===================================*/
 
 // TwiML entrypoint for realtime
+app.post("/voice-realtime", (req, res) => {
+  console.log("[/voice-realtime] HIT", req.get("User-Agent"), "CallSid=", req.body?.CallSid);
+  const wsUrl = (PUBLIC_WS_URL && PUBLIC_WS_URL.trim())
+    ? PUBLIC_WS_URL.trim()
+    : `wss://${req.headers.host}/twilio-media`;
+
+  const twiml = `
+    <Response>
+      <Connect>
+        <Stream url="${wsUrl}">
+          <Parameter name="callSid" value="${(req.body?.CallSid || "").toString()}"/>
+          <Parameter name="audioTrack" value="inbound_track"/>
+        </Stream>
+      </Connect>
+    </Response>`;
+  res.type("text/xml").status(200).send(twiml);
+});
+
 app.post("/voice-realtime", (req, res) => {
   const wsUrl = (PUBLIC_WS_URL && PUBLIC_WS_URL.trim())
     ? PUBLIC_WS_URL.trim()
