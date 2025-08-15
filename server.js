@@ -312,10 +312,10 @@ app.get("/api/voicemails", async (_req, res) => {
 
 // TwiML entrypoint for realtime
 app.post("/voice-realtime", (req, res) => {
-  console.log("[/voice-realtime] HIT", req.get("User-Agent"), "CallSid=", req.body?.CallSid);
   const wsUrl =
     (PUBLIC_WS_URL && PUBLIC_WS_URL.trim()) || `wss://${req.headers.host}/twilio-media`;
 
+  // Minimal TwiML: just Stream. Greeting will come from the model.
   const twiml = `
     <Response>
       <Connect>
@@ -326,24 +326,6 @@ app.post("/voice-realtime", (req, res) => {
       </Connect>
     </Response>`;
   res.type("text/xml").status(200).send(twiml);
-});
-
-app.post("/voice-realtime", (req, res) => {
-  const wsUrl = (PUBLIC_WS_URL && PUBLIC_WS_URL.trim())
-    ? PUBLIC_WS_URL.trim()
-    : `wss://${req.headers.host}/twilio-media`;
-
-  // Keep it minimal; don't give Twilio extra verbs to run after Stream ends.
-  const twiml = `
-    <Response>
-      <Connect>
-        <Stream url="${wsUrl}">
-          <Parameter name="callSid" value="${(req.body?.CallSid || "").toString()}"/>
-          <Parameter name="audioTrack" value="inbound_track"/>
-        </Stream>
-      </Connect>
-    </Response>`;
-  res.type("text/xml").send(twiml);
 });
 
 // A dedicated voicemail TwiML that records and then hits /voicemail-complete
@@ -479,13 +461,14 @@ wss.on("connection", async (twilioWs, req) => {
     }));
 
     // Assistant greeting from model (not Twilio)
-    safeSendToOpenAI(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio","text"],
-        instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?"
-      }
-    }));
+   safeSendToOpenAI(JSON.stringify({
+     type: "response.create",
+     response: {
+       modalities: ["audio","text"],
+       instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?",
+       audio: { voice: "alloy" } // <-- ensure TTS voice is set
+     }
+   }));
 
     // flush any queued messages
     while (queueToOpenAI.length) { try { openaiWs.send(queueToOpenAI.shift()); } catch {} }
@@ -568,6 +551,10 @@ wss.on("connection", async (twilioWs, req) => {
       if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
 
       const pcm24 = Buffer.from(b64, "base64");
+      if (!twilioWs._firstOutLogged) {
+      console.log("[openai->twilio] first chunk bytes=", pcm24.length);
+      twilioWs._firstOutLogged = true;
+    }
       const mu    = pcm24kToTwilioMuLawBytes(pcm24);
       enqueueMuLawFrames(mu);
       return;
