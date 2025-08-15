@@ -316,16 +316,14 @@ app.post("/voice-realtime", (req, res) => {
   const wsUrl = (PUBLIC_WS_URL && PUBLIC_WS_URL.trim())
     ? PUBLIC_WS_URL.trim()
     : `wss://${req.headers.host}/twilio-media`;
-  console.log("[voice-realtime] responding with <Stream> to", wsUrl);
 
-  const callSid = (req.body?.CallSid || "").toString();
-
+  // Keep it minimal; don't give Twilio extra verbs to run after Stream ends.
   const twiml = `
     <Response>
-      <Say voice="Polly.Joanna">Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?</Say>
       <Connect>
         <Stream url="${wsUrl}">
-          <Parameter name="callSid" value="${callSid}"/>
+          <Parameter name="callSid" value="${(req.body?.CallSid || "").toString()}"/>
+          <Parameter name="audioTrack" value="inbound_track"/>
         </Stream>
       </Connect>
     </Response>`;
