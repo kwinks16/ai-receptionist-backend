@@ -42,6 +42,30 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY, timeout: 60000 });
 /* ================================
    HELPERS
 ===================================*/
+async function transferToVoicemail(callSid, baseUrl) {
+  if (!callSid) throw new Error("No callSid to transfer");
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
+
+  // Point the live call at /voicemail-twiml (TwiML redirect)
+  const twimlUrl = `${baseUrl}/voicemail-twiml`;
+  const body = new URLSearchParams({ Url: twimlUrl, Method: "POST" });
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`Twilio transfer failed ${resp.status}: ${txt}`);
+  }
+  console.log("[transfer] call redirected to", twimlUrl);
+}
+
 function nowIso() { return new Date().toISOString(); }
 
 function summarize(text = "") {
@@ -294,13 +318,35 @@ app.post("/voice-realtime", (req, res) => {
     : `wss://${req.headers.host}/twilio-media`;
   console.log("[voice-realtime] responding with <Stream> to", wsUrl);
 
+  const callSid = (req.body?.CallSid || "").toString();
+
   const twiml = `
     <Response>
-      <Say voice="Polly.Joanna">Connecting you. One moment please.</Say>
+      <Say voice="Polly.Joanna">Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?</Say>
       <Connect>
-        <Stream url="${wsUrl}" />
+        <Stream url="${wsUrl}">
+          <Parameter name="callSid" value="${callSid}"/>
+        </Stream>
       </Connect>
     </Response>`;
+  res.type("text/xml").send(twiml);
+});
+
+// A dedicated voicemail TwiML that records and then hits /voicemail-complete
+const VOICEMAIL_PROMPT =
+  process.env.VOICEMAIL_PROMPT ||
+  "Okay, please leave your message after the tone. Press any key when you're done.";
+
+app.post("/voicemail-twiml", (req, res) => {
+  const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
+  const actionUrl = `${base}/voicemail-complete`;
+  const twiml = `
+    <Response>
+      <Say voice="Polly.Joanna">${VOICEMAIL_PROMPT}</Say>
+      <Record action="${actionUrl}" method="POST" maxLength="120" finishOnKey="*" playBeep="true" />
+      <Say>We didn't receive a recording. Goodbye.</Say>
+    </Response>
+  `;
   res.type("text/xml").send(twiml);
 });
 
@@ -338,12 +384,29 @@ wss.on("connection", async (twilioWs, req) => {
 
   let streamSid = null;
   let openaiOpen = false;
-
   let silenceTimer = null;     // keep-alive loop handle
   let audioDeltaCount = 0;     // number of audio chunks seen for current response
-
   let commitTimer = null;
+  let callSid = null;
 
+  // Parse possible callSid from URL query as fallback
+  let callSidFallback = null;
+  try {
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    callSidFallback = u.searchParams.get("callSid");
+  } catch {}
+
+  // later, when you receive the "start" event from Twilio:
+  if (msg.event === "start") {
+    streamSid = msg.start?.streamSid || msg.streamSid || null;
+    // Prefer Twilio-provided callSid, else fallback from query
+    callSid = msg.start?.callSid || msg.start?.customParameters?.callSid || callSidFallback || null;
+    console.log("[twilio] start; streamSid =", streamSid, "callSid =", callSid || "(none)");
+    if (!silenceTimer) startSilenceKeepalive();
+    if (txQueue.length > 0) startTxLoop();
+    return;
+  }
+   
   // paced transmitter state
   const FRAME_MS = 20;               // Twilio expects 20ms per frame
   const FRAME_BYTES = 160;           // 160 μ-law bytes = 20ms @ 8kHz
@@ -544,6 +607,39 @@ openaiWs.on("message", (raw) => {
     return;
   }
 
+  if (evt.type === "conversation.item.created" && evt.item?.role === "user") {
+    // Try to extract a transcript/text from the user's item
+    let userText = "";
+    const c = evt.item?.content || [];
+    for (const part of c) {
+      if (typeof part?.transcript === "string") userText += " " + part.transcript;
+      if (typeof part?.text === "string")       userText += " " + part.text;
+      if (part?.type === "input_text" && typeof part?.text === "string") userText += " " + part.text;
+    }
+    userText = (userText || "").toLowerCase();
+
+    // Simple intent check (tune these as you like)
+    const wantsVoicemail =
+      /\bvoicemail\b/.test(userText) ||
+      /leave (a )?message/.test(userText) ||
+      /can i (just )?leave/.test(userText);
+
+    if (wantsVoicemail && callSid) {
+      console.log("[intent] voicemail detected; transferring…");
+      const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
+      try {
+        await transferToVoicemail(callSid, base);
+        // Optionally, tell the model to stop talking right away:
+        // safeSendToOpenAI(JSON.stringify({ type: "response.cancel" }));
+        // And close OpenAI socket since Twilio will be redirected
+        try { openaiWs.close(); } catch {}
+      } catch (e) {
+        console.error("[intent] transfer failed:", e?.message || e);
+      }
+    }
+    return;
+  }
+   
   if (!evt?.type) return;
 
   // Log event types (kept modest to avoid jitter)
