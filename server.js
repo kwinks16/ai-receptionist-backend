@@ -598,7 +598,7 @@ safeSendToOpenAI(JSON.stringify({
 
 // --- OpenAI → Twilio: decode audio delta and enqueue to Twilio ---
 // --- OpenAI → Twilio: decode audio delta and enqueue to Twilio ---
-openaiWs.on("message", (raw) => {
+openaiWs.on("message", async (raw) => {
   let evt;
   try {
     evt = JSON.parse(raw.toString());
