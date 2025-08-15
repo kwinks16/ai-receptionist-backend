@@ -315,9 +315,14 @@ app.post("/voice-realtime", (req, res) => {
   const wsUrl =
     (PUBLIC_WS_URL && PUBLIC_WS_URL.trim()) || `wss://${req.headers.host}/twilio-media`;
 
-  // Minimal TwiML: just Stream. Greeting will come from the model.
+  // Use your personalized greeting from env or fall back
+  const greet = process.env.REALTIME_GREETING
+    || "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. How can I help?";
+
   const twiml = `
     <Response>
+      <Say voice="Polly.Joanna">${greet}</Say>
+      <Pause length="1"/>
       <Connect>
         <Stream url="${wsUrl}">
           <Parameter name="callSid" value="${(req.body?.CallSid || "").toString()}"/>
@@ -446,33 +451,32 @@ wss.on("connection", async (twilioWs, req) => {
     }
   };
 
-  openaiWs.on("open", () => {
-    console.log("[openai] websocket open");
-    openaiOpen = true;
+openaiWs.on("open", () => {
+  console.log("[openai] websocket open");
 
-    // Configure audio I/O
-    safeSendToOpenAI(JSON.stringify({
-      type: "session.update",
-      session: {
-        modalities: ["audio","text"],
-        input_audio_format:  "pcm16", // simple form accepted
-        output_audio_format: "pcm16"
-      }
-    }));
+  // Apply formats + enable turn detection so it doesn’t wait forever
+  const sessionUpdate = {
+    type: "session.update",
+    session: {
+      modalities: ["audio","text"],
+      input_audio_format:  "pcm16",  // simple forms are accepted
+      output_audio_format: "pcm16",
+      turn_detection: { type: "server_vad", silence_duration_ms: 500 }
+    }
+  };
+  openaiWs.send(JSON.stringify(sessionUpdate));
 
-    // Assistant greeting from model (not Twilio)
-   safeSendToOpenAI(JSON.stringify({
-     type: "response.create",
-     response: {
-       modalities: ["audio","text"],
-       instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?",
-       audio: { voice: "alloy" } // <-- ensure TTS voice is set
-     }
-   }));
-
-    // flush any queued messages
-    while (queueToOpenAI.length) { try { openaiWs.send(queueToOpenAI.shift()); } catch {} }
-  });
+  // Ask the model to speak right away (in parallel with the Twilio Say)
+  const immediateGreeting = {
+    type: "response.create",
+    response: {
+      modalities: ["audio","text"],
+      instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?",
+      audio: { voice: "alloy" } // ensure TTS voice is set
+    }
+  };
+  openaiWs.send(JSON.stringify(immediateGreeting));
+});
 
   // Twilio -> OpenAI
   twilioWs.on("message", (raw) => {
