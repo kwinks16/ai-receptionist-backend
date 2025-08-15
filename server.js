@@ -378,347 +378,185 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", async (twilioWs, req) => {
   console.log("[ws] connection established from", req.socket?.remoteAddress);
 
-  // --- constants / state (per-connection) ---
   const RealtimeWS = (await import("ws")).default;
   const OPEN = 1;
 
+  // ---- per-connection state
   let streamSid = null;
-  let openaiOpen = false;
-  let silenceTimer = null;     // keep-alive loop handle
-  let audioDeltaCount = 0;     // number of audio chunks seen for current response
-  let commitTimer = null;
   let callSid = null;
+  let silenceTimer = null;
+  let audioDeltaCount = 0;
+  let txQueue = [];
+  let txTimer = null;
 
-  // Parse possible callSid from URL query as fallback
-  let callSidFallback = null;
+  // Optional: read callSid from query if you append it to the ws URL
   try {
     const u = new URL(req.url, `http://${req.headers.host}`);
-    callSidFallback = u.searchParams.get("callSid");
+    callSid = u.searchParams.get("callSid") || null;
   } catch {}
 
-  // later, when you receive the "start" event from Twilio:
-  if (msg.event === "start") {
-    streamSid = msg.start?.streamSid || msg.streamSid || null;
-    // Prefer Twilio-provided callSid, else fallback from query
-    callSid = msg.start?.callSid || msg.start?.customParameters?.callSid || callSidFallback || null;
-    console.log("[twilio] start; streamSid =", streamSid, "callSid =", callSid || "(none)");
-    if (!silenceTimer) startSilenceKeepalive();
-    if (txQueue.length > 0) startTxLoop();
-    return;
-  }
-   
-  // paced transmitter state
-  const FRAME_MS = 20;               // Twilio expects 20ms per frame
-  const FRAME_BYTES = 160;           // 160 μ-law bytes = 20ms @ 8kHz
-   
-  let txQueue = [];                  // Array<Buffer(160)>
-  let txTimer = null;                // setTimeout handle
-  let nextDeadline = 0;              // drift-corrected scheduler
-  let carry = Buffer.alloc(0);       // leftover bytes between enqueues
-  const PREBUFFER_FRAMES = 8;        // ~160ms buffer to hide jitter
-
-  // --- paced transmit: send one 20ms μ-law frame every ~25ms ---
+  // paced sender (20ms frames)
   function startTxLoop() {
-  if (txTimer) return;
-  nextDeadline = Date.now();
-  const tick = () => {
-    if (!streamSid || twilioWs.readyState !== OPEN) { txTimer = null; return; }
-
-    // send exactly one 20ms frame if available
-    if (txQueue.length > 0) {
+    if (txTimer) return;
+    txTimer = setInterval(() => {
+      if (!streamSid || twilioWs.readyState !== OPEN) return;
+      if (txQueue.length === 0) { clearInterval(txTimer); txTimer = null; return; }
       const frame = txQueue.shift();
       const payload = frame.toString("base64");
-   
-   let sent = 0;  // add near txLoop scope
-
-   try {
-     twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
-     if ((++sent % 20) === 0) {
-       // log every ~400ms (20 frames * 20ms)
-       console.log("[to-twilio] sent frames:", sent, "queue:", txQueue.length);
-     }
-   } catch (e) {
-     console.log("[to-twilio] send error:", e?.message || e);
-     txTimer = null;
-     return;
-   }
-    }
-
-    // drift-corrected scheduling
-    nextDeadline += FRAME_MS;
-    const delay = Math.max(0, nextDeadline - Date.now());
-    txTimer = setTimeout(tick, delay);
-  };
-  txTimer = setTimeout(tick, 0);
-}
-
-function enqueueMuLawFrames(muBytes) {
-  // accumulate then chop into 160B frames
-  carry = Buffer.concat([carry, Buffer.isBuffer(muBytes) ? muBytes : Buffer.from(muBytes)]);
-  while (carry.length >= FRAME_BYTES) {
-    txQueue.push(carry.subarray(0, FRAME_BYTES));
-    carry = carry.subarray(FRAME_BYTES);
+      try {
+        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+      } catch (e) {
+        console.log("[to-twilio] send error:", e?.message || e);
+        clearInterval(txTimer); txTimer = null;
+      }
+    }, 25);
   }
-  // only start once we have a small buffer to smooth bursts
-  if (!txTimer && txQueue.length >= PREBUFFER_FRAMES) startTxLoop();
-}
-
-  // --- local silence keepalive (no external deps) ---
+  function enqueueMuLawFrames(muBytes) {
+    const buf = Buffer.isBuffer(muBytes) ? muBytes : Buffer.from(muBytes);
+    for (let off = 0; off + 160 <= buf.length; off += 160) {
+      txQueue.push(buf.subarray(off, off + 160));
+    }
+    if (txQueue.length > 0) startTxLoop();
+  }
   function startSilenceKeepalive() {
     if (silenceTimer) return;
     let ticks = 0;
-    console.log("[keepalive] starting silence loop");
     silenceTimer = setInterval(() => {
       ticks++;
       if (!streamSid || twilioWs.readyState !== OPEN) return;
-      // μ-law “silence” 0xFF repeated for 160 samples (~20ms)
-      const payload = Buffer.alloc(160, 0xFF).toString("base64");
-      try {
-        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
-        // if (ticks <= 5 || ticks % 5 === 0) console.log(`[keepalive] sent silence tick=${ticks}`);
-      } catch (e) {
-        console.log("[keepalive] send error:", e?.message || e);
-      }
-      if (ticks > 30) { // ~10.5s safety stop
-        clearInterval(silenceTimer); silenceTimer = null;
-        console.log("[keepalive] stopped (timeout)");
-      }
+      const payload = Buffer.alloc(160, 0xFF).toString("base64"); // μ-law silence
+      try { twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } })); } catch {}
+      if (ticks > 30) { clearInterval(silenceTimer); silenceTimer = null; }
     }, 350);
   }
 
-  // --- Connect to OpenAI Realtime (beta header is required) ---
-  const modelUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview";
-  const openaiWs = new RealtimeWS(modelUrl, {
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
+  // ---- OpenAI realtime WS
+  const openaiWs = new RealtimeWS("wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview", {
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
   });
-
-  // --- queue to buffer messages for OpenAI until socket is ready ---
+  let openaiOpen = false;
   const queueToOpenAI = [];
   function safeSendToOpenAI(msg) {
-    if (openaiOpen && openaiWs.readyState === OPEN) {
-      try { openaiWs.send(msg); } catch {}
-    } else {
-      queueToOpenAI.push(msg);
-    }
+    if (openaiOpen && openaiWs.readyState === OPEN) { try { openaiWs.send(msg); } catch {} }
+    else queueToOpenAI.push(msg);
   }
 
-  // --- OpenAI socket: configure + greet immediately ---
   openaiWs.on("open", () => {
-    console.log("[openai] websocket open");
     openaiOpen = true;
-
-    // Configure audio session (I/O formats)
-safeSendToOpenAI(JSON.stringify({
-  type: "session.update",
-  session: {
-    // must include both
-    modalities: ["audio", "text"],
-
-    // set voice at the session level (schema supports this)
-    voice: "alloy",
-
-    // ⬇️ keep it simple: let OpenAI default formats.
-    // (We’ll convert PCM16@24k → μ-law@8k ourselves before sending to Twilio.)
-    input_audio_format: "pcm16"  // string, not object
-    // (omit sample rate & channels; defaults work with our converter)
-  }
-}));
-
-    // Immediate greeting (audio)
-   safeSendToOpenAI(JSON.stringify({
-     type: "response.create",
-     response: {
-       modalities: ["audio", "text"],
-       instructions: "Hello! You’ve reached our AI receptionist. Please speak clearly and I’ll help. (Speak at a calm, even pace.)"
-     }
-   }));
-
-    // Flush any queued messages
-    while (queueToOpenAI.length) {
-      const msg = queueToOpenAI.shift();
-      try { openaiWs.send(msg); } catch {}
-    }
+    safeSendToOpenAI(JSON.stringify({
+      type: "session.update",
+      session: {
+        modalities: ["audio","text"],
+        input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
+        output_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 }
+      }
+    }));
+    // Greeting
+    safeSendToOpenAI(JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio","text"],
+        instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?",
+      }
+    }));
+    // flush queue
+    while (queueToOpenAI.length) { try { openaiWs.send(queueToOpenAI.shift()); } catch {} }
   });
 
-  // --- Twilio -> OpenAI: media and control events ---
+  // ---- Twilio -> OpenAI (THIS is where msg is defined)
   twilioWs.on("message", (raw) => {
-  try {
-    const msg = JSON.parse(raw.toString());
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-   if (msg.event === "start") {
-     streamSid = msg.start?.streamSid || msg.streamSid || null;
-     console.log("[twilio] start; streamSid =", streamSid);
-     if (!silenceTimer) startSilenceKeepalive();  // guard against double-starts
-     if (txQueue.length > 0) startTxLoop();
-     return;
-   }
+    if (msg.event === "start") {
+      streamSid = msg.start?.streamSid || msg.streamSid || null;
+      // prefer Twilio-provided callSid / custom parameter
+      callSid = msg.start?.callSid || msg.start?.customParameters?.callSid || callSid || null;
+      console.log("[twilio] start; streamSid=", streamSid, "callSid=", callSid || "(none)");
+      if (!silenceTimer) startSilenceKeepalive();
+      if (txQueue.length > 0) startTxLoop();
+      return;
+    }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // Twilio μ-law (8k) -> PCM16 (24k), then append to OpenAI buffer
-      const pcm24 = twilioChunkToPcm24k(msg.media.payload); // Buffer PCM16@24k
-      safeSendToOpenAI(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: pcm24.toString("base64")
-      }));
+      // μ-law 8k → PCM16 24k
+      const pcm24 = twilioChunkToPcm24k(msg.media.payload);
+      safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm24.toString("base64") }));
 
-      // ---- debounce: if no new media for 400ms, commit + request a response
-      if (commitTimer) clearTimeout(commitTimer);
-      commitTimer = setTimeout(() => {
-        // Tell OpenAI “I’m done sending this chunk of speech”
+      // debounce commit + response
+      if (twilioWs._commitTimer) clearTimeout(twilioWs._commitTimer);
+      twilioWs._commitTimer = setTimeout(() => {
         safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-        // Ask it to speak back (modalities must include both per your logs)
         safeSendToOpenAI(JSON.stringify({
           type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            instructions: "Answer briefly and helpfully."
-          }
+          response: { modalities: ["audio","text"] }
         }));
       }, 400);
-
-      return; // your original return is fine
+      return;
     }
 
     if (msg.event === "stop") {
       console.log("[twilio] stop event");
-      if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
       return;
     }
-  } catch (e) {
-    console.error("Twilio WS parse error:", e?.message || e);
-  }
-});
+  });
 
-  // --- OpenAI -> Twilio: stream audio deltas, pace out as 160B frames ---
-  // --- OpenAI -> Twilio (definitive handler) ---
+  // ---- OpenAI -> Twilio
+  openaiWs.on("message", async (raw) => {
+    let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
+    if (!evt?.type) return;
 
-// --- OpenAI → Twilio: decode audio delta and enqueue to Twilio ---
-// --- OpenAI → Twilio: decode audio delta and enqueue to Twilio ---
-openaiWs.on("message", async (raw) => {
-  let evt;
-  try {
-    evt = JSON.parse(raw.toString());
-  } catch (e) {
-    console.error("[openai] parse error:", e?.message || e);
-    return;
-  }
-
-  if (evt.type === "conversation.item.created" && evt.item?.role === "user") {
-    // Try to extract a transcript/text from the user's item
-    let userText = "";
-    const c = evt.item?.content || [];
-    for (const part of c) {
-      if (typeof part?.transcript === "string") userText += " " + part.transcript;
-      if (typeof part?.text === "string")       userText += " " + part.text;
-      if (part?.type === "input_text" && typeof part?.text === "string") userText += " " + part.text;
-    }
-    userText = (userText || "").toLowerCase();
-
-    // Simple intent check (tune these as you like)
-    const wantsVoicemail =
-      /\bvoicemail\b/.test(userText) ||
-      /leave (a )?message/.test(userText) ||
-      /can i (just )?leave/.test(userText);
-
-    if (wantsVoicemail && callSid) {
-      console.log("[intent] voicemail detected; transferring…");
-      const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
-      try {
-        await transferToVoicemail(callSid, base);
-        // Optionally, tell the model to stop talking right away:
-        // safeSendToOpenAI(JSON.stringify({ type: "response.cancel" }));
-        // And close OpenAI socket since Twilio will be redirected
-        try { openaiWs.close(); } catch {}
-      } catch (e) {
-        console.error("[intent] transfer failed:", e?.message || e);
+    // Voicemail intent: catch user's utterance
+    if (evt.type === "conversation.item.created" && evt.item?.role === "user") {
+      let userText = "";
+      for (const part of (evt.item.content || [])) {
+        if (typeof part?.transcript === "string") userText += " " + part.transcript;
+        if (typeof part?.text === "string")       userText += " " + part.text;
+        if (part?.type === "input_text" && typeof part?.text === "string") userText += " " + part.text;
       }
-    }
-    return;
-  }
-   
-  if (!evt?.type) return;
+      userText = userText.toLowerCase();
+      const wantsVoicemail =
+        /\bvoicemail\b/.test(userText) ||
+        /leave (a )?message/.test(userText) ||
+        /can i (just )?leave/.test(userText);
 
-  // Log event types (kept modest to avoid jitter)
-  if (evt.type !== "response.audio.delta") {
-    console.log("[openai] evt:", evt.type);
-  }
-
-  // Print full errors (these are infrequent)
-  if (evt.type === "error" || evt.type === "response.error") {
-    console.log("[openai] ERROR evt:", JSON.stringify(evt, null, 2));
-    return;
-  }
-
-  if (evt.type === "response.audio.delta") {
-    // Normalize the base64 field across schema variants
-    let b64 = null;
-    if (typeof evt.delta === "string") {
-      b64 = evt.delta;
-    } else if (evt.delta && typeof evt.delta.audio === "string") {
-      b64 = evt.delta.audio;
-    } else if (evt.delta && typeof evt.delta.data === "string") {
-      b64 = evt.delta.data;
-    } else if (typeof evt.audio === "string") {
-      b64 = evt.audio;
-    } else if (typeof evt.bytes === "string") {
-      b64 = evt.bytes;
-    }
-
-    if (!b64) {
-      console.log(
-        "[openai] delta had no recognized audio field; keys in delta =",
-        Object.keys(evt.delta || {})
-      );
-      return;
-    }
-
-    // Stop keepalive on the first real audio frame
-    if (audioDeltaCount === 0 && silenceTimer) {
-      clearInterval(silenceTimer);
-      silenceTimer = null;
-      console.log("[keepalive] stopped on first model audio");
-    }
-    audioDeltaCount += 1;
-
-    // Convert model PCM16@24k → μ-law@8k, then enqueue
-    let pcm24;
-    try {
-      pcm24 = Buffer.from(b64, "base64");
-      if (!pcm24.length) {
-        console.log("[openai] delta base64 decoded to 0 bytes (skipping)");
+      if (wantsVoicemail && callSid) {
+        const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
+        try {
+          await transferToVoicemail(callSid, base);
+          try { openaiWs.close(); } catch {}
+        } catch (e) {
+          console.error("[intent] transfer failed:", e?.message || e);
+        }
         return;
       }
-    } catch (e) {
-      console.log("[openai] base64 decode failed:", e?.message || e);
+    }
+
+    if (evt.type === "response.audio.delta") {
+      // normalize base64
+      let b64 = null;
+      if (typeof evt.delta === "string") b64 = evt.delta;
+      else if (evt.delta && typeof evt.delta.audio === "string") b64 = evt.delta.audio;
+      else if (evt.delta && typeof evt.delta.data  === "string") b64 = evt.delta.data;
+      else if (typeof evt.audio === "string") b64 = evt.audio;
+      else if (typeof evt.bytes === "string") b64 = evt.bytes;
+      if (!b64) return;
+
+      if (audioDeltaCount++ === 0 && silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+
+      const pcm24 = Buffer.from(b64, "base64");
+      const muBytes = pcm24kToTwilioMuLawBytes(pcm24);
+      enqueueMuLawFrames(muBytes);
       return;
     }
 
-    const muBytes = pcm24kToTwilioMuLawBytes(pcm24); // Buffer of μ-law@8k bytes
-    // Throttle logs: show size only for first chunk of each response
-    if (audioDeltaCount === 1) {
-      const frames = Math.floor(muBytes.length / 160);
-      console.log("[enqueue] first model bytes =", muBytes.length, "frames≈", frames);
+    if (evt.type === "response.done") {
+      audioDeltaCount = 0;
+      return;
     }
-    enqueueMuLawFrames(muBytes); // paced sender drains @ ~20ms
-    return;
-  }
+  });
 
-  if (evt.type === "response.done") {
-    console.log("[openai] response done; deltas =", audioDeltaCount);
-    audioDeltaCount = 0;
-  }
-});
-
-  // --- close/error logs & cleanup ---
-  twilioWs.on("close", (code, reason) => { console.log("[twilio] ws close:", code, reason?.toString()); });
-  twilioWs.on("error", (err) => { console.log("[twilio] ws error:", err?.message || err); });
-  openaiWs.on("close", (code, reason) => { console.log("[openai] ws close:", code, reason?.toString()); });
-  openaiWs.on("error", (err) => { console.log("[openai] ws error:", err?.message || err); });
-
+  // ---- cleanup
   const cleanup = () => {
     if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
     if (txTimer) { clearInterval(txTimer); txTimer = null; }
