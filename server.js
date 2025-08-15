@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 import { OpenAI } from "openai";
@@ -20,7 +21,8 @@ const {
   TWILIO_AUTH_TOKEN,
   OPENAI_API_KEY,
   FIRESTORE_COLLECTION = "voicemails",
-  GREETING_TEXT = "Hi! You've reached our AI receptionist. Please leave a message after the beep."
+  GREETING_TEXT = "Hi! You've reached our AI receptionist. Please leave a message after the beep.",
+  VOICEMAIL_PROMPT = "Okay, please leave your message after the tone. Press any key when you're done."
 } = process.env;
 
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OPENAI_API_KEY) {
@@ -41,6 +43,8 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY, timeout: 60000 });
 /* ================================
    HELPERS
 ===================================*/
+function nowIso() { return new Date().toISOString(); }
+
 async function transferToVoicemail(callSid, baseUrl) {
   if (!callSid) throw new Error("No callSid to transfer");
   const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
@@ -64,8 +68,6 @@ async function transferToVoicemail(callSid, baseUrl) {
   }
   console.log("[transfer] call redirected to", twimlUrl);
 }
-
-function nowIso() { return new Date().toISOString(); }
 
 function summarize(text = "") {
   const t = text.trim();
@@ -145,15 +147,13 @@ function genToneMuLawBytes(durationMs = 1000, freqHz = 440, gain = 0.6) {
   const totalSamples = Math.floor(sampleRate * (durationMs / 1000));
   const twoPiOverFs = 2 * Math.PI * freqHz / sampleRate;
 
-  // make PCM16
   const pcm = new Int16Array(totalSamples);
   for (let n = 0; n < totalSamples; n++) {
     const v = Math.sin(twoPiOverFs * n) * gain;
     pcm[n] = Math.max(-1, Math.min(1, v)) * 32767;
   }
-  // μ-law encode
-  const mu = muLawEncode(pcm); // Uint8Array
-  return Buffer.from(mu);      // raw μ-law bytes
+  const mu = muLawEncode(pcm);
+  return Buffer.from(mu);
 }
 
 /* ---- Simple linear resampler: Int16 mono PCM ---- */
@@ -176,20 +176,18 @@ function resampleLinear(int16In, inRate, outRate) {
 
 // Twilio μ-law 8k (base64 payload) -> PCM16 24k (Buffer)
 function twilioChunkToPcm24k(base64) {
-  // Twilio sends media.payload as base64 μ-law bytes @ 8000 Hz
-  const u8 = Buffer.from(base64, "base64");        // μ-law bytes
-  const pcm8k = muLawDecode(u8);                   // Int16Array @ 8k
+  const u8 = Buffer.from(base64, "base64");                // μ-law bytes @ 8k
+  const pcm8k = muLawDecode(u8);                           // Int16Array @ 8k
   const pcm24 = resampleLinear(Int16Array.from(pcm8k), 8000, 24000); // Int16Array @ 24k
-  return Buffer.from(new Int16Array(pcm24).buffer); // Buffer (PCM16 @ 24k)
+  return Buffer.from(new Int16Array(pcm24).buffer);        // Buffer (PCM16 @ 24k)
 }
 
 // PCM16 24k (Buffer) -> Twilio μ-law 8k (raw bytes Buffer)
 function pcm24kToTwilioMuLawBytes(buf) {
-  // buf: Buffer of PCM16 little-endian @ 24000 Hz, mono
   const int16_24k = new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2);
-  const int16_8k  = resampleLinear(int16_24k, 24000, 8000);   // Int16Array @ 8k
-  const mu        = muLawEncode(Int16Array.from(int16_8k));   // Uint8Array μ-law
-  return Buffer.from(mu);                                     // raw μ-law bytes
+  const int16_8k  = resampleLinear(int16_24k, 24000, 8000);
+  const mu        = muLawEncode(Int16Array.from(int16_8k));
+  return Buffer.from(mu);
 }
 
 /* ================================
@@ -199,7 +197,7 @@ app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true, t: nowIso() }));
 
 /* ================================
-   VOICEMAIL FLOW
+   CLASSIC VOICEMAIL FLOW
 ===================================*/
 app.post("/voice", (req, res) => {
   const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
@@ -211,7 +209,7 @@ app.post("/voice", (req, res) => {
       <Say voice="Polly.Joanna">${greet}</Say>
       <Pause length="1"/>
       <Say>Please leave your message after the tone. Press any key to finish.</Say>
-      <Record action="${actionUrl}" method="POST" maxLength="90" finishOnKey="*" playBeep="true" />
+      <Record action="${actionUrl}" method="POST" maxLength="120" finishOnKey="*" playBeep="true" />
       <Say>We didn't receive a recording. Goodbye.</Say>
     </Response>`;
   res.type("text/xml").send(twiml);
@@ -221,10 +219,9 @@ app.post("/voicemail-complete", async (req, res) => {
   try {
     const recordingUrl = (req.body?.RecordingUrl || "").toString();
     const from = (req.body?.From || "").toString();
-    const to = (req.body?.To || "").toString();
     const callSid = (req.body?.CallSid || "").toString();
 
-    console.log(`[vm] callback: CallSid=${callSid} From=${from || "undefined"} To=${to || "undefined"} RecordingUrl=${recordingUrl}`);
+    console.log(`[vm] callback: CallSid=${callSid || "?"} From=${from || "?"} RecordingUrl=${recordingUrl}`);
 
     if (!recordingUrl) { res.type("text/xml").send("<Response/>"); return; }
 
@@ -258,7 +255,7 @@ app.post("/voicemail-complete", async (req, res) => {
 });
 
 /* ================================
-   Q&A (Grounded in FAQ text sent by the app)
+   Q&A (Grounded in FAQ text sent by the app; no web)
 ===================================*/
 app.post("/qa", async (req, res) => {
   try {
@@ -268,7 +265,7 @@ app.post("/qa", async (req, res) => {
     const system = [
       "You are an AI receptionist for a small business.",
       "Answer only using the provided Knowledge Base.",
-      "If the answer is not in the KB, say you don't have that info and suggest leaving a message or checking back.",
+      "If the answer is not in the KB, say you don't have that info and suggest leaving a message.",
       "Be concise (1–3 sentences), friendly, and accurate. Do not invent facts."
     ].join(" ");
     const kbHeader = businessName ? `Business: ${businessName}\n` : "";
@@ -310,19 +307,14 @@ app.get("/api/voicemails", async (_req, res) => {
    REALTIME VOICE (Twilio <Stream> ↔ OpenAI)
 ===================================*/
 
-// TwiML entrypoint for realtime
+// Single TwiML entrypoint for realtime
 app.post("/voice-realtime", (req, res) => {
   const wsUrl =
     (PUBLIC_WS_URL && PUBLIC_WS_URL.trim()) || `wss://${req.headers.host}/twilio-media`;
 
-  // Use your personalized greeting from env or fall back
-  const greet = process.env.REALTIME_GREETING
-    || "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. How can I help?";
-
   const twiml = `
     <Response>
-      <Say voice="Polly.Joanna">${greet}</Say>
-      <Pause length="1"/>
+      <Say voice="Polly.Joanna">Connecting you. One moment please.</Say>
       <Connect>
         <Stream url="${wsUrl}">
           <Parameter name="callSid" value="${(req.body?.CallSid || "").toString()}"/>
@@ -334,10 +326,6 @@ app.post("/voice-realtime", (req, res) => {
 });
 
 // A dedicated voicemail TwiML that records and then hits /voicemail-complete
-const VOICEMAIL_PROMPT =
-  process.env.VOICEMAIL_PROMPT ||
-  "Okay, please leave your message after the tone. Press any key when you're done.";
-
 app.post("/voicemail-twiml", (req, res) => {
   const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
   const actionUrl = `${base}/voicemail-complete`;
@@ -346,8 +334,7 @@ app.post("/voicemail-twiml", (req, res) => {
       <Say voice="Polly.Joanna">${VOICEMAIL_PROMPT}</Say>
       <Record action="${actionUrl}" method="POST" maxLength="120" finishOnKey="*" playBeep="true" />
       <Say>We didn't receive a recording. Goodbye.</Say>
-    </Response>
-  `;
+    </Response>`;
   res.type("text/xml").send(twiml);
 });
 
@@ -393,6 +380,9 @@ wss.on("connection", async (twilioWs, req) => {
 
   // μ-law silence keepalive (stops on first model audio)
   let silenceTimer = null;
+
+  // voicemail intent only after first model turn
+  let firstModelTurnDone = false;
 
   function startTxLoop() {
     if (txTimer) return;
@@ -451,32 +441,32 @@ wss.on("connection", async (twilioWs, req) => {
     }
   };
 
-openaiWs.on("open", () => {
-  console.log("[openai] websocket open");
+  openaiWs.on("open", () => {
+    console.log("[openai] websocket open");
+    openaiOpen = true;
 
-  // Apply formats + enable turn detection so it doesn’t wait forever
-  const sessionUpdate = {
-    type: "session.update",
-    session: {
-      modalities: ["audio","text"],
-      input_audio_format:  "pcm16",  // simple forms are accepted
-      output_audio_format: "pcm16",
-      turn_detection: { type: "server_vad", silence_duration_ms: 500 }
-    }
-  };
-  openaiWs.send(JSON.stringify(sessionUpdate));
+    // Configure audio I/O
+    safeSendToOpenAI(JSON.stringify({
+      type: "session.update",
+      session: {
+        modalities: ["audio","text"],
+        input_audio_format:  "pcm16", // short form OK
+        output_audio_format: "pcm16"
+      }
+    }));
 
-  // Ask the model to speak right away (in parallel with the Twilio Say)
-  const immediateGreeting = {
-    type: "response.create",
-    response: {
-      modalities: ["audio","text"],
-      instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?",
-      audio: { voice: "alloy" } // ensure TTS voice is set
-    }
-  };
-  openaiWs.send(JSON.stringify(immediateGreeting));
-});
+    // Assistant greeting from model
+    safeSendToOpenAI(JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio","text"],
+        instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?"
+      }
+    }));
+
+    // flush queued messages
+    while (queueToOpenAI.length) { try { openaiWs.send(queueToOpenAI.shift()); } catch {} }
+  });
 
   // Twilio -> OpenAI
   twilioWs.on("message", (raw) => {
@@ -497,7 +487,7 @@ openaiWs.on("open", () => {
       const pcm24 = twilioChunkToPcm24k(msg.media.payload);
       safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm24.toString("base64") }));
 
-      // commit/respond after short pause in speech (debounced)
+      // debounced commit/response for snappy turn-taking
       if (twilioWs._commitTimer) clearTimeout(twilioWs._commitTimer);
       twilioWs._commitTimer = setTimeout(() => {
         safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.commit" }));
@@ -512,38 +502,62 @@ openaiWs.on("open", () => {
     }
   });
 
-  // OpenAI -> Twilio
+  // OpenAI -> Twilio (audio + voicemail intent)
+  const wantsVoicemail = (text) => {
+    const t = (text || "").toLowerCase();
+    return (
+      /\bvoicemail\b/.test(t) ||
+      /\bleave (a )?message\b/.test(t) ||
+      /\bcan i (just )?leave\b/.test(t) ||
+      /\btake (a )?message\b/.test(t)
+    );
+  };
+
   openaiWs.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
     if (!evt?.type) return;
 
-    // Detect voicemail intent (optional; keep if you want that feature)
-    if (evt.type === "conversation.item.created" && evt.item?.role === "user") {
+    // Mark first model turn complete
+    if (evt.type === "response.done" || evt.type === "response.output_item.done") {
+      if (!firstModelTurnDone) firstModelTurnDone = true;
+    }
+
+    // Detect voicemail intent only after the greeting has finished
+    if (evt.type === "conversation.item.created" && evt.item?.role === "user" && firstModelTurnDone) {
       let userText = "";
       for (const part of (evt.item.content || [])) {
         if (typeof part?.transcript === "string") userText += " " + part.transcript;
         if (typeof part?.text === "string")       userText += " " + part.text;
         if (part?.type === "input_text" && typeof part?.text === "string") userText += " " + part.text;
       }
-      userText = userText.toLowerCase();
-      const wantsVoicemail =
-        /\bvoicemail\b/.test(userText) ||
-        /leave (a )?message/.test(userText) ||
-        /can i (just )?leave/.test(userText);
-      if (wantsVoicemail && callSid) {
+      if (wantsVoicemail(userText)) {
         const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
+        // brief confirmation
+        try {
+          openaiWs.send(JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["audio","text"],
+              instructions: "Sure—I'll switch you to voicemail. Please leave your message after the beep."
+            }
+          }));
+        } catch {}
+        // hand off the live call
         try {
           await transferToVoicemail(callSid, base);
-          try { openaiWs.close(); } catch {}
         } catch (e) {
-          console.error("[intent] transfer failed:", e?.message || e);
+          console.error("[voicemail] transfer failed:", e?.message || e);
         }
+        // end sockets (Twilio will leave the stream and hit /voicemail-twiml)
+        try { openaiWs.close(); } catch {}
+        try { twilioWs.close(); } catch {}
         return;
       }
     }
 
     // Stream model audio to Twilio (24k PCM → 8k μ-law, paced)
     if (evt.type === "response.audio.delta") {
+      // Normalize base64 field across schema variants
       let b64 = null;
       if (typeof evt.delta === "string") b64 = evt.delta;
       else if (evt.delta && typeof evt.delta.audio === "string") b64 = evt.delta.audio;
@@ -555,10 +569,6 @@ openaiWs.on("open", () => {
       if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
 
       const pcm24 = Buffer.from(b64, "base64");
-      if (!twilioWs._firstOutLogged) {
-      console.log("[openai->twilio] first chunk bytes=", pcm24.length);
-      twilioWs._firstOutLogged = true;
-    }
       const mu    = pcm24kToTwilioMuLawBytes(pcm24);
       enqueueMuLawFrames(mu);
       return;
