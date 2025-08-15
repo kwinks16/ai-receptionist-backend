@@ -313,9 +313,8 @@ app.get("/api/voicemails", async (_req, res) => {
 // TwiML entrypoint for realtime
 app.post("/voice-realtime", (req, res) => {
   console.log("[/voice-realtime] HIT", req.get("User-Agent"), "CallSid=", req.body?.CallSid);
-  const wsUrl = (PUBLIC_WS_URL && PUBLIC_WS_URL.trim())
-    ? PUBLIC_WS_URL.trim()
-    : `wss://${req.headers.host}/twilio-media`;
+  const wsUrl =
+    (PUBLIC_WS_URL && PUBLIC_WS_URL.trim()) || `wss://${req.headers.host}/twilio-media`;
 
   const twiml = `
     <Response>
@@ -396,21 +395,18 @@ wss.on("connection", async (twilioWs, req) => {
   const RealtimeWS = (await import("ws")).default;
   const OPEN = 1;
 
-  // ---- per-connection state
+  // per-connection state
   let streamSid = null;
   let callSid = null;
+  let openaiOpen = false;
+
+  // pacing back to Twilio
+  let txQueue = [];     // Buffer(160) frames
+  let txTimer = null;   // setInterval handle
+
+  // μ-law silence keepalive (stops on first model audio)
   let silenceTimer = null;
-  let audioDeltaCount = 0;
-  let txQueue = [];
-  let txTimer = null;
 
-  // Optional: read callSid from query if you append it to the ws URL
-  try {
-    const u = new URL(req.url, `http://${req.headers.host}`);
-    callSid = u.searchParams.get("callSid") || null;
-  } catch {}
-
-  // paced sender (20ms frames)
   function startTxLoop() {
     if (txTimer) return;
     txTimer = setInterval(() => {
@@ -420,12 +416,12 @@ wss.on("connection", async (twilioWs, req) => {
       const payload = frame.toString("base64");
       try {
         twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
-      } catch (e) {
-        console.log("[to-twilio] send error:", e?.message || e);
+      } catch {
         clearInterval(txTimer); txTimer = null;
       }
-    }, 25);
+    }, 25); // ~20ms media + small cushion
   }
+
   function enqueueMuLawFrames(muBytes) {
     const buf = Buffer.isBuffer(muBytes) ? muBytes : Buffer.from(muBytes);
     for (let off = 0; off + 160 <= buf.length; off += 160) {
@@ -433,79 +429,92 @@ wss.on("connection", async (twilioWs, req) => {
     }
     if (txQueue.length > 0) startTxLoop();
   }
+
   function startSilenceKeepalive() {
     if (silenceTimer) return;
     let ticks = 0;
+    console.log("[keepalive] starting silence loop");
     silenceTimer = setInterval(() => {
-      ticks++;
       if (!streamSid || twilioWs.readyState !== OPEN) return;
       const payload = Buffer.alloc(160, 0xFF).toString("base64"); // μ-law silence
       try { twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } })); } catch {}
-      if (ticks > 30) { clearInterval(silenceTimer); silenceTimer = null; }
+      if (++ticks % 5 === 0) console.log("[keepalive] sent silence tick=", ticks);
+      if (ticks > 30) { clearInterval(silenceTimer); silenceTimer = null; console.log("[keepalive] stopped (timeout)"); }
     }, 350);
   }
 
-  // ---- OpenAI realtime WS
-  const openaiWs = new RealtimeWS("wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview", {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" }
-  });
-  let openaiOpen = false;
+  // Optional: read callSid from query (fallback)
+  try {
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    callSid = u.searchParams.get("callSid") || null;
+  } catch {}
+
+  // OpenAI Realtime
+  const openaiWs = new RealtimeWS(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview",
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
+  );
+
   const queueToOpenAI = [];
-  function safeSendToOpenAI(msg) {
-    if (openaiOpen && openaiWs.readyState === OPEN) { try { openaiWs.send(msg); } catch {} }
-    else queueToOpenAI.push(msg);
-  }
+  const safeSendToOpenAI = (msg) => {
+    if (openaiOpen && openaiWs.readyState === OPEN) {
+      try { openaiWs.send(msg); } catch {}
+    } else {
+      queueToOpenAI.push(msg);
+    }
+  };
 
   openaiWs.on("open", () => {
+    console.log("[openai] websocket open");
     openaiOpen = true;
+
+    // Configure audio I/O
     safeSendToOpenAI(JSON.stringify({
       type: "session.update",
       session: {
         modalities: ["audio","text"],
-        input_audio_format:  { type: "pcm16", sample_rate_hz: 24000, channels: 1 },
-        output_audio_format: { type: "pcm16", sample_rate_hz: 24000, channels: 1 }
+        input_audio_format:  "pcm16", // simple form accepted
+        output_audio_format: "pcm16"
       }
     }));
-    // Greeting
+
+    // Assistant greeting from model (not Twilio)
     safeSendToOpenAI(JSON.stringify({
       type: "response.create",
       response: {
         modalities: ["audio","text"],
-        instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?",
+        instructions: "Hi, I'm Kyle's AI assistant. I can answer questions, schedule appointments, or take a voicemail. What can I help you with?"
       }
     }));
-    // flush queue
+
+    // flush any queued messages
     while (queueToOpenAI.length) { try { openaiWs.send(queueToOpenAI.shift()); } catch {} }
   });
 
-  // ---- Twilio -> OpenAI (THIS is where msg is defined)
+  // Twilio -> OpenAI
   twilioWs.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       streamSid = msg.start?.streamSid || msg.streamSid || null;
-      // prefer Twilio-provided callSid / custom parameter
-      callSid = msg.start?.callSid || msg.start?.customParameters?.callSid || callSid || null;
+      callSid   = msg.start?.callSid || msg.start?.customParameters?.callSid || callSid || null;
       console.log("[twilio] start; streamSid=", streamSid, "callSid=", callSid || "(none)");
-      if (!silenceTimer) startSilenceKeepalive();
+      startSilenceKeepalive();
       if (txQueue.length > 0) startTxLoop();
       return;
     }
 
     if (msg.event === "media" && msg.media?.payload) {
-      // μ-law 8k → PCM16 24k
+      // 8k μ-law → 24k PCM → append
       const pcm24 = twilioChunkToPcm24k(msg.media.payload);
       safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm24.toString("base64") }));
 
-      // debounce commit + response
+      // commit/respond after short pause in speech (debounced)
       if (twilioWs._commitTimer) clearTimeout(twilioWs._commitTimer);
       twilioWs._commitTimer = setTimeout(() => {
         safeSendToOpenAI(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        safeSendToOpenAI(JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio","text"] }
-        }));
+        safeSendToOpenAI(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] } }));
       }, 400);
       return;
     }
@@ -516,12 +525,12 @@ wss.on("connection", async (twilioWs, req) => {
     }
   });
 
-  // ---- OpenAI -> Twilio
+  // OpenAI -> Twilio
   openaiWs.on("message", async (raw) => {
     let evt; try { evt = JSON.parse(raw.toString()); } catch { return; }
     if (!evt?.type) return;
 
-    // Voicemail intent: catch user's utterance
+    // Detect voicemail intent (optional; keep if you want that feature)
     if (evt.type === "conversation.item.created" && evt.item?.role === "user") {
       let userText = "";
       for (const part of (evt.item.content || [])) {
@@ -534,7 +543,6 @@ wss.on("connection", async (twilioWs, req) => {
         /\bvoicemail\b/.test(userText) ||
         /leave (a )?message/.test(userText) ||
         /can i (just )?leave/.test(userText);
-
       if (wantsVoicemail && callSid) {
         const base = (PUBLIC_BASE_URL && PUBLIC_BASE_URL.trim()) || (`https://${req.headers.host}`);
         try {
@@ -547,31 +555,26 @@ wss.on("connection", async (twilioWs, req) => {
       }
     }
 
+    // Stream model audio to Twilio (24k PCM → 8k μ-law, paced)
     if (evt.type === "response.audio.delta") {
-      // normalize base64
       let b64 = null;
       if (typeof evt.delta === "string") b64 = evt.delta;
       else if (evt.delta && typeof evt.delta.audio === "string") b64 = evt.delta.audio;
       else if (evt.delta && typeof evt.delta.data  === "string") b64 = evt.delta.data;
       else if (typeof evt.audio === "string") b64 = evt.audio;
-      else if (typeof evt.bytes === "string") b64 = evt.bytes;
       if (!b64) return;
 
-      if (audioDeltaCount++ === 0 && silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
+      // first audio? stop keepalive
+      if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
 
       const pcm24 = Buffer.from(b64, "base64");
-      const muBytes = pcm24kToTwilioMuLawBytes(pcm24);
-      enqueueMuLawFrames(muBytes);
-      return;
-    }
-
-    if (evt.type === "response.done") {
-      audioDeltaCount = 0;
+      const mu    = pcm24kToTwilioMuLawBytes(pcm24);
+      enqueueMuLawFrames(mu);
       return;
     }
   });
 
-  // ---- cleanup
+  // cleanup
   const cleanup = () => {
     if (silenceTimer) { clearInterval(silenceTimer); silenceTimer = null; }
     if (txTimer) { clearInterval(txTimer); txTimer = null; }
